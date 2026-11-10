@@ -18,9 +18,11 @@ Built as a portfolio project. Design choices should be defensible in an intervie
 | Background jobs | Celery with Redis as the broker; Flower dashboard |
 | App database | Postgres + SQLAlchemy + Alembic migrations |
 | Vector search | Qdrant (dense + sparse hybrid search) |
-| File storage | S3-compatible object storage (MinIO locally; see [Open items](#open-items)) |
+| File storage | S3-compatible object storage: SeaweedFS (see note below) |
 | Cache / locks / progress | Redis |
 | Deploy | Docker Compose, locally and on one cloud VM behind Caddy (auto HTTPS) |
+
+**Why SeaweedFS, not MinIO:** MinIO's free community edition was archived in 2026 and its official Docker image can no longer be pulled. SeaweedFS is Apache-2.0 licensed, runs as a single container and speaks the S3 API. The app talks to storage only through an S3 client in `services/`, so the store can be swapped by changing config.
 
 ---
 
@@ -71,7 +73,7 @@ Built as a portfolio project. Design choices should be defensible in an intervie
 | `worker` | Celery consumer on queue `ingest` | HTTP |
 | `postgres` | Source of truth for everything except raw files and vectors | Vector search |
 | `qdrant` | Chunk vectors + filter payload. **Rebuildable** from the `pages` table | Being the source of truth |
-| `minio` (or replacement) | Raw uploaded files | — |
+| `seaweedfs` | Raw uploaded files (S3 API) | — |
 | `redis` | Broker, progress pub/sub, locks, rate limits, cache | Holding anything that can't be lost |
 | `flower` | Celery dashboard | — |
 | `caddy` | HTTPS reverse proxy (cloud deploy only) | — |
@@ -400,5 +402,4 @@ Backend first (1–6) so the hard parts work before any UI exists.
 ## Open items
 
 - **Models:** the user has a Google AI Studio key; choose specific Gemini models for coach / exam / grader / OCR / embeddings and put them in `.env`.
-- **Object storage image:** check MinIO's current Docker image and licensing before step 1 (its free-edition distribution reportedly changed in 2025). Fall back to another S3-compatible store or a local volume behind the same storage interface.
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.
