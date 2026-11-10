@@ -233,9 +233,10 @@ All endpoints except auth require a JWT in a secure, httpOnly cookie. All check 
 
 ```
 Auth
-  POST   /auth/register                  {username, password}
+  POST   /auth/register                  {username, password} → creates account, sets cookie
   POST   /auth/login                     {username, password} → sets cookie
   POST   /auth/logout
+  GET    /auth/me                        current user, or 401
 
 Courses
   GET    /courses

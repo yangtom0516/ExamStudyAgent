@@ -30,8 +30,10 @@ class Settings(BaseSettings):
     s3_secret_key: SecretStr
     s3_bucket: str
 
-    # Auth (required)
-    jwt_secret: SecretStr
+    # Auth
+    jwt_secret: SecretStr  # required
+    jwt_expire_minutes: int = 60 * 24 * 7  # login lasts 7 days
+    cookie_secure: bool = False  # True in the cloud deploy: send the login cookie over HTTPS only
 
     # Gemini (needed from build step 3 on)
     google_api_key: SecretStr = SecretStr("")
