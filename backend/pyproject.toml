@@ -1,0 +1,33 @@
+[project]
+name = "examstudy-backend"
+version = "0.1.0"
+description = "API, agents and ingestion worker for the Exam Study Agent"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.10",
+    "redis>=5.2",
+    "qdrant-client>=1.12",
+    "boto3>=1.35",
+]
+
+[dependency-groups]
+# Installed by `uv sync` for development, left out of the production image.
+dev = [
+    "pytest>=8.3",
+    "httpx2",  # HTTP client used by FastAPI's TestClient (preferred over httpx by current Starlette)
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+# This is an application, not a library: don't build/install it as a package.
+package = false

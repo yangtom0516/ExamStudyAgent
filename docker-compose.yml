@@ -1,0 +1,82 @@
+# Exam Study Agent: local stack.
+# Step 1a: the four data stores. The api, worker, flower and web services are added in later steps.
+#
+# Ports are bound to 127.0.0.1 so they are reachable from this machine only.
+# Values like ${POSTGRES_PASSWORD} are read from the .env file next to this one.
+
+name: examstudy
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: study
+      POSTGRES_DB: study
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/<major>/, so mount the parent.
+      - postgres_data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U study -d study"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.8.4-alpine
+    # Append-only file so queued jobs survive a restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"   # HTTP API + dashboard at /dashboard
+      - "127.0.0.1:6334:6334"   # gRPC
+    healthcheck:
+      # The image has bash but no curl; just check the port accepts connections.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  seaweedfs:
+    # S3-compatible file storage (replaces MinIO; see CLAUDE.md).
+    image: chrislusf/seaweedfs:4.53
+    # One process runs master + volume + filer + S3 gateway.
+    command: ["server", "-dir=/data", "-ip=seaweedfs", "-ip.bind=0.0.0.0", "-s3", "-s3.port=8333"]
+    environment:
+      # With these set, the S3 gateway requires these keys; without them it would allow anonymous access.
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+    volumes:
+      - seaweedfs_data:/data
+    ports:
+      - "127.0.0.1:8333:8333"   # S3 API
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/status || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  seaweedfs_data:
