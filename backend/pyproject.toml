@@ -1,0 +1,19 @@
+[project]
+name = "examstudy-backend"
+version = "0.1.0"
+description = "API, agents and ingestion worker for the Exam Study Agent"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "redis>=5.2",
+    "qdrant-client>=1.12",
+    "boto3>=1.35",
+]
+
+[tool.uv]
+# This is an application, not a library: don't build/install it as a package.
+package = false
