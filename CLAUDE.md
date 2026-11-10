@@ -4,7 +4,7 @@ A multi-user web app where students upload lecture slides and past exams, then c
 
 Built as a portfolio project. Design choices should be defensible in an interview without being overkill: the expected load is a handful of users at once.
 
-**Status:** design approved; build not started (see [Build order](#build-order)).
+**Status:** step 1 (foundation) done; step 2 next (see [Build order](#build-order)).
 
 ---
 
@@ -311,6 +311,7 @@ Exams
 |---|---|---|
 | Unit (`tests/unit`) | Chunkers (slide, page, past-exam question split), deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
 | API (`tests/api`) | Auth; **user A can't access user B's data**; session lock 409s; answer key hidden before grading; chat lock | Every push, against Postgres/Redis/Qdrant in Docker |
+| Test isolation | API tests use database `study_test`, Redis DB 15 and bucket `<S3_BUCKET>-test` (set in `tests/conftest.py`), so they never touch dev data | — |
 | Agent evals (`tests/evals`) | Monopoly sample course: ExamWriter produces a valid exam whose sources point to real chunks; Grader scores known-good answers high and known-bad answers low; LLM-as-judge for quality | Manually (costs API calls) |
 
 ---
@@ -386,7 +387,7 @@ One repository on purpose: agents share models, services and config with the API
 
 Each step ends with something runnable.
 
-- [ ] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
+- [x] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
 - [ ] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
 - [ ] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam question splitting, hybrid search.
 - [ ] **4. ExamWriter** + its tools + exam schema (try it via a script or `adk web`).
