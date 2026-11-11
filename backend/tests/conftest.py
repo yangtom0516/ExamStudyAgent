@@ -89,6 +89,21 @@ def client(test_database):
 
 
 @pytest.fixture
+def login_as(client):
+    """Switch the client to a user, registering them on first use: login_as("alice")."""
+
+    def _login_as(username: str) -> None:
+        client.cookies.clear()
+        credentials = {"username": username, "password": "password123"}
+        response = client.post("/auth/login", json=credentials)
+        if response.status_code == 401:
+            response = client.post("/auth/register", json=credentials)
+        assert response.status_code in (200, 201), response.text
+
+    return _login_as
+
+
+@pytest.fixture
 def db_fetch_one(test_database):
     """Run a SELECT against the test database and return the first row as a dict."""
     return lambda sql, **params: asyncio.run(_fetch_one(sql, params))

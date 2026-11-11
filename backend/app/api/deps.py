@@ -1,12 +1,18 @@
-"""Shared FastAPI dependencies. Endpoints declare what they need, e.g. `user: CurrentUser`."""
+"""Shared FastAPI dependencies. Endpoints declare what they need, e.g. `user: CurrentUser`.
 
+Ownership rule: an item that exists but belongs to someone else gets the same 404 as one that
+doesn't exist, so other users' IDs can't be probed.
+"""
+
+import uuid
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.db.models import User
+from app.db.models import Course, StudySession, User
 from app.db.session import get_db
 from app.services.security import read_access_token
 
@@ -26,3 +32,27 @@ async def get_current_user(request: Request, db: DbSession, settings: SettingsDe
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_owned_course(course_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Course:
+    """The course from the URL's {course_id}, if it belongs to the logged-in user."""
+    course = await db.scalar(select(Course).where(Course.id == course_id, Course.user_id == user.id))
+    if course is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
+    return course
+
+
+async def get_owned_session(session_id: uuid.UUID, user: CurrentUser, db: DbSession) -> StudySession:
+    """The study session from the URL's {session_id}, if its course belongs to the logged-in user."""
+    study_session = await db.scalar(
+        select(StudySession)
+        .join(Course, StudySession.course_id == Course.id)
+        .where(StudySession.id == session_id, Course.user_id == user.id)
+    )
+    if study_session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    return study_session
+
+
+OwnedCourse = Annotated[Course, Depends(get_owned_course)]
+OwnedSession = Annotated[StudySession, Depends(get_owned_session)]

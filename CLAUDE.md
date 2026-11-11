@@ -85,21 +85,22 @@ Built as a portfolio project. Design choices should be defensible in an intervie
 ```
 users          id, username (unique, 3–30 chars), password_hash, created_at
 courses        id, user_id → users, name, created_at
-sessions       id, course_id → courses, name, status (setup | active), started_at, created_at
-documents      id, session_id → sessions, filename, storage_key, kind (lecture | past_exam | notes),
+study_sessions id, course_id → courses, name, status (setup | active), started_at, created_at
+documents      id, session_id → study_sessions, filename, storage_key, kind (lecture | past_exam | notes),
                status (queued | processing | ready | failed), error, page_count, created_at
 pages          id, document_id → documents, page_number, text, source (text | ocr)
 topics         id, course_id → courses, name, normalized_name (unique per course)
 document_topics document_id, topic_id, page_start, page_end
 topic_scores   course_id, topic_id, points_earned, points_possible, updated_at
-exams          id, session_id → sessions, title, request (user's prompt), questions (JSONB, see below), created_at
+exams          id, session_id → study_sessions, title, request (user's prompt), questions (JSONB, see below), created_at
 attempts       id, exam_id → exams, answers (JSONB), status (submitted | grading | graded | grading_failed),
                score, max_score, created_at, graded_at
 attempt_grades attempt_id, question_id, points, feedback, citations (JSONB)   -- one row per question, upserted
 (ADK session tables, managed by ADK's DatabaseSessionService, one ADK session per study session)
 ```
 
-- Ownership chain: `users → courses → sessions → documents/exams → attempts`. Every query checks it.
+- The table is `study_sessions`, not `sessions`, because ADK's `DatabaseSessionService` creates its own `sessions` table. URLs still say `/sessions/...`.
+- Ownership chain: `users → courses → study_sessions → documents/exams → attempts`. Every query checks it. Someone else's item returns **404, the same as a missing one**, so IDs can't be probed (`OwnedCourse` / `OwnedSession` dependencies in `api/deps.py`).
 - `pages` keeps extracted text so Qdrant can be rebuilt (e.g. after changing embedding model) without re-uploading or re-running OCR.
 - Deleting a course or session cascades to rows, object-store files and Qdrant points (`delete by filter session_id`).
 
@@ -241,12 +242,14 @@ Auth
 Courses
   GET    /courses
   POST   /courses                        {name}
+  GET    /courses/{id}
   DELETE /courses/{id}                   cascades
   GET    /courses/{id}/topics            topics + this course's scores
 
 Sessions
   GET    /courses/{id}/sessions
   POST   /courses/{id}/sessions          {name} → status=setup
+  GET    /sessions/{id}
   DELETE /sessions/{id}                  cascades
   POST   /sessions/{id}/start            409 unless every document is ready → status=active
 
