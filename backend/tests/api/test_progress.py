@@ -33,10 +33,10 @@ def test_successful_ingestion_reports_each_stage(client, session, run_ingest, pu
     document = upload_ok(client, session["id"], content=make_pdf(["Heaps", "Graphs"]))
     run_ingest(document["id"])
 
-    assert [e["stage"] for e in published] == ["parsing", "indexing", "ready"]
+    assert [e["stage"] for e in published] == ["parsing", "finding_topics", "indexing", "ready"]
     assert all(e["document_id"] == document["id"] and e["session_id"] == session["id"] for e in published)
-    assert published[1]["page_count"] == 2
-    assert published[2]["page_count"] == 2 and published[2]["chunk_count"] == 2
+    assert published[2]["page_count"] == 2
+    assert published[3]["page_count"] == 2 and published[3]["chunk_count"] == 2
 
 
 def test_failed_ingestion_reports_the_error(client, session, run_ingest, published):

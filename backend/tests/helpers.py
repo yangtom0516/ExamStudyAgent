@@ -141,3 +141,21 @@ class FakeOcr:
     async def read_page(self, page_pdf: bytes) -> str:
         self.pages.append(page_pdf)
         return self.text
+
+
+class FakeTopics:
+    """Stands in for Gemini topic extraction: returns fixed (name, page_start, page_end) topics
+    and remembers what it was asked."""
+
+    def __init__(self, topics: list[tuple[str, int, int]] = (), error: Exception | None = None) -> None:
+        self.topics = list(topics)
+        self.error = error
+        self.calls: list[dict] = []
+
+    async def extract(self, pages, existing, title):
+        from app.ingest.topics import TopicRange
+
+        self.calls.append({"existing": list(existing), "title": title, "pages": len(pages)})
+        if self.error:
+            raise self.error
+        return [TopicRange(name=name, page_start=start, page_end=end) for name, start, end in self.topics]

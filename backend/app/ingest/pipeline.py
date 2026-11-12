@@ -1,5 +1,5 @@
-"""Ingest one document: download -> parse -> OCR scanned pages -> save pages -> chunk -> embed ->
-index in Qdrant -> ready.
+"""Ingest one document: download -> parse -> OCR scanned pages -> save pages -> chunk -> topics ->
+embed -> index in Qdrant -> ready.
 
 Safe to run more than once for the same document (Celery may deliver a job twice, e.g. after
 a worker crash): pages are replaced, not added, and Qdrant point IDs are deterministic.
@@ -28,6 +28,15 @@ from app.ingest.chunking import chunk_pages
 from app.ingest.embedding import Embedder, GeminiEmbedder
 from app.ingest.ocr import GeminiOcr, PageReader
 from app.ingest.parsers import ParsedPage, UnreadableFileError, parse_document, split_pdf_pages
+from app.ingest.topics import (
+    GeminiTopics,
+    TopicExtractor,
+    clean_topics,
+    course_topic_names,
+    load_document_topics,
+    save_document_topics,
+    topics_by_page,
+)
 from app.services import progress
 from app.services.storage import Storage
 from app.services.vectors import DENSE, VectorStore, chunk_point_id
@@ -47,6 +56,7 @@ class IngestDeps:
     vectors: VectorStore
     embedder: Embedder
     ocr: PageReader
+    topics: TopicExtractor
     publish: progress.Publisher
     max_ocr_pages: int
 
@@ -57,6 +67,7 @@ async def open_deps(
     embedder: Embedder | None = None,
     publish: progress.Publisher | None = None,
     ocr: PageReader | None = None,
+    topics: TopicExtractor | None = None,
 ) -> AsyncIterator[IngestDeps]:
     # NullPool: each Celery job runs in its own event loop, so don't keep connections between jobs.
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
@@ -71,6 +82,7 @@ async def open_deps(
             vectors=vectors,
             embedder=embedder or GeminiEmbedder(settings),
             ocr=ocr or GeminiOcr(settings),
+            topics=topics or GeminiTopics(settings),
             publish=publish or functools.partial(progress.publish, redis),
             max_ocr_pages=settings.max_ocr_pages,
         )
@@ -169,22 +181,26 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
         await db.execute(update(Document).where(Document.id == job.document_id).values(page_count=len(pages)))
         await db.commit()
 
-    # 3. Chunk and embed.
+    # 3. Chunk (checked before the topic call, so a file with no text costs nothing more).
     chunks = chunk_pages(pages, slides=job.extension == ".pptx")
     if not chunks:
         raise UnreadableFileError(NO_TEXT_ERROR)
-    await _report(job, deps, progress.INDEXING, page_count=len(pages))
     title = PurePosixPath(job.filename).stem
+
+    # 4. Topics, so each chunk can be tagged with the topics of its page.
+    page_topics = await _find_topics(job, deps, pages, title)
+
+    # 5. Embed.
+    await _report(job, deps, progress.INDEXING, page_count=len(pages))
     vectors = await deps.embedder.embed_documents([c.text for c in chunks], title=title)
 
-    # 4. Index in Qdrant. Old points go first, in case an earlier run produced more chunks.
+    # 6. Index in Qdrant. Old points go first, in case an earlier run produced more chunks.
     payload = {
         "user_id": str(job.user_id),
         "course_id": str(job.course_id),
         "session_id": str(job.session_id),
         "document_id": str(job.document_id),
         "kind": job.kind,
-        "topics": [],  # filled by topic extraction in step 3
     }
     points = [
         models.PointStruct(
@@ -194,6 +210,7 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
                 **payload,
                 "page_number": chunk.page_number,
                 "chunk_index": chunk.chunk_index,
+                "topics": page_topics.get(chunk.page_number, []),  # normalized names
                 "text": chunk.text,
             },
         )
@@ -202,7 +219,7 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     await deps.vectors.delete_document(job.document_id)
     await deps.vectors.upsert(points)
 
-    # 5. Done.
+    # 7. Done.
     if await _finish(job, deps, DocumentStatus.READY, None):
         await _report(job, deps, progress.READY, page_count=len(pages), chunk_count=len(chunks))
         logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
@@ -254,6 +271,24 @@ async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[Pars
         else p
         for p in pages
     ]
+
+
+async def _find_topics(job: _Job, deps: IngestDeps, pages: list[ParsedPage], title: str) -> dict[int, list[str]]:
+    """Find the document's topics (one Gemini call), merge them into the course, and return
+    page number -> topic names. Topics saved by an earlier run of this document are reused."""
+    async with deps.sessionmaker() as db:
+        ranges = await load_document_topics(db, job.document_id)
+        existing = await course_topic_names(db, job.course_id) if not ranges else []
+
+    if not ranges:
+        await _report(job, deps, progress.FINDING_TOPICS)
+        raw = await deps.topics.extract(pages, existing, title)  # slow: no database session held
+        ranges = clean_topics(raw, page_count=len(pages))
+        async with deps.sessionmaker() as db:
+            await save_document_topics(db, job.course_id, job.document_id, ranges)
+            await db.commit()
+        logger.info("Document %s: %d topic ranges", job.document_id, len(ranges))
+    return topics_by_page(ranges)
 
 
 async def _finish(job: _Job, deps: IngestDeps, status: DocumentStatus, error: str | None) -> bool:

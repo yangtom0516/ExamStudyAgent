@@ -123,3 +123,33 @@ class Page(Base):
     page_number: Mapped[int] = mapped_column(Integer)  # 1-based, as shown in PDF viewers
     text: Mapped[str] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(10), default=PageSource.TEXT, server_default="text")
+
+
+class Topic(Base):
+    """A topic of a course ("Heaps"), merged across all its documents by normalized name.
+
+    Topics belong to the course, not to a session, so scores (step 5) carry over between sessions.
+    """
+
+    __tablename__ = "topics"
+    __table_args__ = (UniqueConstraint("course_id", "normalized_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    course_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(100))  # as first seen, for display
+    normalized_name: Mapped[str] = mapped_column(String(100))  # lowercase, punctuation removed; the merge key
+
+
+class DocumentTopic(Base):
+    """Which pages of a document cover a topic. A topic can have several ranges in one document."""
+
+    __tablename__ = "document_topics"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    topic_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("topics.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    page_start: Mapped[int] = mapped_column(Integer, primary_key=True)
+    page_end: Mapped[int] = mapped_column(Integer)

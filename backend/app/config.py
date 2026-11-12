@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     grader_model: str = ""
     ocr_model: str = "gemini-3.5-flash-lite"  # cheap, fast, reads PDFs and images
     max_ocr_pages: int = 100  # per file; caps the cost of one huge scanned upload
+    topic_model: str = "gemini-3.5-flash-lite"  # topic extraction (one call per document)
     embed_model: str = "gemini-embedding-2"
     embed_dimensions: int = 768  # Google recommends 768, 1536 or 3072; smaller = less storage
 

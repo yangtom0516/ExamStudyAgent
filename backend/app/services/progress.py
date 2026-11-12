@@ -7,6 +7,7 @@ the event, which is why the SSE stream starts with a snapshot from Postgres (the
 Event: {"document_id", "session_id", "stage", ...extras}
   stage "parsing"                 the worker started reading the file
   stage "reading_scans"  pages_done, pages_total   OCR of scanned pages (only if there are any)
+  stage "finding_topics"          one Gemini call listing the document's topics
   stage "indexing"   page_count   text extracted; embedding and indexing the chunks
   stage "ready"      page_count, chunk_count
   stage "failed"     error        user-facing message
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 PARSING = "parsing"
 READING_SCANS = "reading_scans"
+FINDING_TOPICS = "finding_topics"
 INDEXING = "indexing"
 READY = "ready"
 FAILED = "failed"

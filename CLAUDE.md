@@ -129,7 +129,7 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 - One collection per embedding model and vector size, e.g. `chunks__gemini-embedding-2__768`. The active collection name comes from config. Re-embedding = build a new collection from `pages`, then switch config.
 - Embeddings: `gemini-embedding-2` at 768 dimensions, cosine distance. This model takes the task as a text prefix: chunks are embedded as `title: <file name> | text: <chunk>`, queries as `task: search result | query: <query>`.
 - Each point: dense vector + sparse (keyword) vector + payload `{user_id, course_id, session_id, document_id, kind, page_number, chunk_index, topics[], text}`.
-- Payload indexes on `user_id`, `session_id`, `kind`.
+- Payload indexes on `user_id`, `session_id`, `document_id`, `kind`, `topics` (missing ones are added on startup). `topics` holds normalized topic names, e.g. `["binary heaps"]`.
 - **Every search filters on `user_id` + `session_id`.** The filter is applied inside the search service, never chosen by the LLM.
 - **Hybrid search** (dense + sparse, fused) so exact terms like "Dijkstra" or "Theorem 3.2" are found as well as paraphrases.
 - Point IDs are deterministic: `uuid5(document_id:page:chunk_index)`. Writes are **upserts**, so re-running ingestion never duplicates.
@@ -155,12 +155,16 @@ Triggered by `POST /sessions/{id}/documents`: the API saves the file to object s
 1. Parse PDF/PPTX → pages. Detect scanned pages: a PDF page with **< 20 characters of text and at least one image** (`OCR_MAX_TEXT_CHARS` in `ingest/parsers.py`). Blank pages without images are skipped.
 2. OCR those pages with Gemini (`OCR_MODEL`, default `gemini-3.5-flash-lite`): each page is cut out as a one-page PDF and sent with `ingest/prompts/ocr.md` ("transcribe exactly"). Saved with `source = 'ocr'`. Pages already read in an earlier run of the same document are reused, so a Retry doesn't pay for OCR twice. More than `MAX_OCR_PAGES` (100) scanned pages in one file → `failed` with a "split the file" message.
 3. Save `pages` rows.
-4. Extract topics: **one** LLM call per document → topics with page ranges → merge into course topics.
+4. Extract topics: **one** LLM call per document (`TOPIC_MODEL`, prompt `ingest/prompts/topics.md`, structured JSON output) → topics with page ranges → merge into course topics.
+   - The course's existing topic names are in the prompt ("reuse these names"), so documents don't create near-duplicates like "Heaps" / "Binary Heaps".
+   - The answer is cleaned (pages clamped to the document, junk names dropped, at most 20 topics), then merged by normalized name (lowercase, punctuation removed; `+`/`#` kept). New topics are inserted with `ON CONFLICT DO NOTHING` on `(course_id, normalized_name)`, so concurrent documents can't duplicate a topic.
+   - Each chunk's payload `topics` = the topics whose range covers its page. Topics from an earlier run of the document are reused on Retry. An unusable answer fails the document (Retry).
+   - Course topics stay when documents are deleted (coverage drops to 0), so scores carry over.
 5. Chunk (rules above), embed, upsert into Qdrant.
 6. Mark the document `ready`.
 
 Progress events are published at each step to Redis channel `progress:{user_id}` (pub/sub, `services/progress.py`) and forwarded to the browser by `GET /sessions/{id}/events` (SSE):
-- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `reading_scans` (+`pages_done`, `pages_total`; only if the file has scanned pages) → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`).
+- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `reading_scans` (+`pages_done`, `pages_total`; only if the file has scanned pages) → `finding_topics` → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`).
 - The stream first sends a `snapshot` event (session status + every document, from Postgres), then `progress` events for that session only, and a `: ping` comment every 15 s when idle. Pub/sub stores nothing, so the snapshot is what makes late or reconnecting browsers correct; Postgres stays the source of truth.
 - The stream subscribes before reading the snapshot, so no event falls in the gap. Publishing never fails a job.
 
@@ -250,7 +254,7 @@ Courses
   POST   /courses                        {name}
   GET    /courses/{id}
   DELETE /courses/{id}                   cascades
-  GET    /courses/{id}/topics            topics + this course's scores
+  GET    /courses/{id}/topics            topics + coverage {documents, pages} (ready documents only); scores from step 5
 
 Sessions
   GET    /courses/{id}/sessions
@@ -293,7 +297,7 @@ Exams
 | Login / Register | Username + password |
 | Courses | List, "+ New course" |
 | Course | Sessions list, "+ New session", topic list colored by score |
-| Session (setup) | Drag-and-drop upload, file list with live progress (`queued → parsing → reading scans (3/12) → indexing → ready` / failed + Retry), delete, **Start session** (disabled until all ready) |
+| Session (setup) | Drag-and-drop upload, file list with live progress (`queued → parsing → reading scans (3/12) → finding topics → indexing → ready` / failed + Retry), delete, **Start session** (disabled until all ready) |
 | Session (active) | Locked file list; chat with StudyCoach (input disabled during an agent turn, status lines shown); "Mock exams" tab with scores |
 | Take exam | Questions, radio buttons / text boxes, Submit |
 | Results | Score, ✅/❌ per question, feedback, correct answer, links to source slides/pages |
@@ -319,7 +323,7 @@ Exams
 
 | Kind | Covers | Runs |
 |---|---|---|
-| Unit (`tests/unit`) | Chunkers (slide, page, past-exam question split), deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
+| Unit (`tests/unit`) | Chunkers (slide, page, past-exam question split), parsers and scan detection, topic name normalization and cleanup, Gemini retries, deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
 | API (`tests/api`) | Auth; **user A can't access user B's data**; session lock 409s; answer key hidden before grading; chat lock | Every push, against Postgres/Redis/Qdrant in Docker |
 | Test isolation | API tests use database `study_test`, Redis DB 15, bucket `<S3_BUCKET>-test` and Qdrant collection `<collection>__test` (set in `tests/conftest.py`), so they never touch dev data. They never call Gemini (fake embedder) or the real job queue | — |
 | Agent evals (`tests/evals`) | Monopoly sample course: ExamWriter produces a valid exam whose sources point to real chunks; Grader scores known-good answers high and known-bad answers low; LLM-as-judge for quality | Manually (costs API calls) |
@@ -335,6 +339,7 @@ EXAM_MODEL=
 GRADER_MODEL=
 OCR_MODEL=gemini-3.5-flash-lite
 MAX_OCR_PAGES=100
+TOPIC_MODEL=gemini-3.5-flash-lite
 EMBED_MODEL=gemini-embedding-2
 EMBED_DIMENSIONS=768
 QDRANT_COLLECTION=      # derived from EMBED_MODEL + EMBED_DIMENSIONS if empty

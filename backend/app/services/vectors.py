@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 DENSE = "dense"  # meaning-based vector (Gemini embedding)
 SPARSE = "sparse"  # keyword vector for hybrid search; filled in from step 3
-INDEXED_FIELDS = ("user_id", "session_id", "document_id", "kind")
+INDEXED_FIELDS = ("user_id", "session_id", "document_id", "kind", "topics")
 UPSERT_BATCH = 128
 
 # Fixed namespace so the same chunk always gets the same point ID (see chunk_point_id).
@@ -39,24 +39,28 @@ class VectorStore:
         self.dimensions = dimensions
 
     async def ensure_collection(self) -> None:
-        if await self.client.collection_exists(self.collection):
-            return
-        try:
-            await self.client.create_collection(
-                self.collection,
-                vectors_config={DENSE: models.VectorParams(size=self.dimensions, distance=models.Distance.COSINE)},
-                sparse_vectors_config={SPARSE: models.SparseVectorParams()},
-            )
-        except Exception:
-            # Another process (API or worker) may have created it at the same moment.
-            if await self.client.collection_exists(self.collection):
-                return
-            raise
+        """Create the collection if needed, and any payload index it's missing (e.g. one added
+        in a later version of the app)."""
+        if not await self.client.collection_exists(self.collection):
+            try:
+                await self.client.create_collection(
+                    self.collection,
+                    vectors_config={
+                        DENSE: models.VectorParams(size=self.dimensions, distance=models.Distance.COSINE)
+                    },
+                    sparse_vectors_config={SPARSE: models.SparseVectorParams()},
+                )
+                logger.info("Created Qdrant collection %s", self.collection)
+            except Exception:
+                # Another process (API or worker) may have created it at the same moment.
+                if not await self.client.collection_exists(self.collection):
+                    raise
+        indexed = (await self.client.get_collection(self.collection)).payload_schema or {}
         for field in INDEXED_FIELDS:
-            await self.client.create_payload_index(
-                self.collection, field, field_schema=models.PayloadSchemaType.KEYWORD
-            )
-        logger.info("Created Qdrant collection %s", self.collection)
+            if field not in indexed:
+                await self.client.create_payload_index(
+                    self.collection, field, field_schema=models.PayloadSchemaType.KEYWORD
+                )
 
     async def upsert(self, points: list[models.PointStruct]) -> None:
         for start in range(0, len(points), UPSERT_BATCH):
