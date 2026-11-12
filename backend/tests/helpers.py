@@ -159,3 +159,21 @@ class FakeTopics:
         if self.error:
             raise self.error
         return [TopicRange(name=name, page_start=start, page_end=end) for name, start, end in self.topics]
+
+
+class FakeQuestionCounter:
+    """Stands in for Gemini question counting: returns fixed (number, type, points) questions
+    and remembers each call."""
+
+    def __init__(self, questions: list[tuple[str, str, int | None]] = (), error: Exception | None = None) -> None:
+        self.questions = list(questions)
+        self.error = error
+        self.calls: list[dict] = []
+
+    async def count(self, pages, title):
+        from app.ingest.past_exams import QuestionItem
+
+        self.calls.append({"title": title, "pages": len(pages)})
+        if self.error:
+            raise self.error
+        return [QuestionItem(number=n, type=t, points=p) for n, t, p in self.questions]

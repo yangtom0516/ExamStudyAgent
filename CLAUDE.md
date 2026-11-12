@@ -91,6 +91,8 @@ documents      id, session_id → study_sessions, filename, storage_key, kind (l
 pages          id, document_id → documents, page_number, text, source (text | ocr)
 topics         id, course_id → courses, name, normalized_name (unique per course)
 document_topics document_id, topic_id, page_start, page_end
+past_exam_questions document_id, position, number, type (multiple_choice | short_answer | long_answer | other), points
+               -- structure of uploaded past exams only, no question text
 topic_scores   course_id, topic_id, points_earned, points_possible, updated_at
 exams          id, session_id → study_sessions, title, request (user's prompt), questions (JSONB, see below), created_at
 attempts       id, exam_id → exams, answers (JSONB), status (submitted | grading | graded | grading_failed),
@@ -140,7 +142,7 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 |---|---|
 | PPTX | 1 slide = 1 chunk (slide text + speaker notes) |
 | Lecture/notes PDF | Per page; long pages split recursively (~800 chars, ~80 overlap) |
-| Past exam | 1 question = 1 chunk (so ExamWriter can retrieve real questions by topic) |
+| Past exam | **Not chunked or indexed.** Only its structure is kept: one Gemini call lists each question's type and printed points (`past_exam_questions`). ExamWriter uses the counts as a reference for a realistic exam shape, not the questions' content |
 | Scanned / image-only pages | Gemini vision OCR → text, then chunked as above (PDF only for now) |
 
 Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks the extension **and** the file's first bytes (`%PDF-`, or the ZIP signature for PPTX): 415 for other types, 413 if too large, 422 if empty. Files are stored at `sessions/<session_id>/<document_id>.<ext>`, so a session's files are deleted by prefix. The cloud deploy should also cap request bodies in Caddy, since the app only sees the size after the upload has been received.
@@ -163,8 +165,13 @@ Triggered by `POST /sessions/{id}/documents`: the API saves the file to object s
 5. Chunk (rules above), embed, upsert into Qdrant.
 6. Mark the document `ready`.
 
+**Past exams** take a shorter path: parse → OCR → save `pages` → **count questions** (one call, `TOPIC_MODEL`, prompt `ingest/prompts/past_exam.md`, structured JSON: `number`, `type`, `points` per question) → `ready`. No topic call, no embeddings, no Qdrant points.
+- Counting rule: every separately answered item counts (10 MC items = 10 questions); a written question counts once including its sub-parts, unless the sub-parts are of different types.
+- Unknown types become `other`; implausible points are dropped. Zero questions found → still `ready` (contributes nothing). Retry reuses the stored structure.
+- The text stays in `pages`, so past exams could be indexed later without re-uploading.
+
 Progress events are published at each step to Redis channel `progress:{user_id}` (pub/sub, `services/progress.py`) and forwarded to the browser by `GET /sessions/{id}/events` (SSE):
-- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `reading_scans` (+`pages_done`, `pages_total`; only if the file has scanned pages) → `finding_topics` → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`).
+- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `reading_scans` (+`pages_done`, `pages_total`; only if the file has scanned pages) → `finding_topics` → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`). Past exams: `parsing` → `reading_scans` → `counting_questions` → `ready` (+`page_count`, `question_count`).
 - The stream first sends a `snapshot` event (session status + every document, from Postgres), then `progress` events for that session only, and a `: ping` comment every 15 s when idle. Pub/sub stores nothing, so the snapshot is what makes late or reconnecting browsers correct; Postgres stays the source of truth.
 - The stream subscribes before reading the snapshot, so no event falls in the gap. Publishing never fails a job.
 
@@ -206,8 +213,8 @@ Understands the request, asks follow-up questions when needed (topics, number an
 
 | Tool | Purpose |
 |---|---|
-| `search_course_materials(query, kind?)` | Hybrid search in this session's chunks; returns text + citations |
-| `get_past_exam_questions(topic)` | Real past-exam questions on a topic (style/difficulty reference) |
+| `search_course_materials(query, kind?)` | Hybrid search in this session's chunks (lectures and notes); returns text + citations |
+| `get_exam_profile()` | This session's topics with coverage, and its past exams' structure (questions per type, average per exam, points), as a reference for a realistic exam shape (`services/exam_profile.py`) |
 | `list_course_topics()` | For even topic coverage |
 | `get_weak_topics()` | Default focus when the request is vague |
 | `save_exam(exam)` | Validates and saves atomically; **returns validation errors so the agent can fix and retry** |
@@ -262,6 +269,7 @@ Sessions
   GET    /sessions/{id}
   DELETE /sessions/{id}                  cascades
   POST   /sessions/{id}/start            409 unless ≥1 document and every document is ready → status=active
+  GET    /sessions/{id}/exam-profile     topics of this session's ready lectures/notes + past-exam structure
 
 Documents (only while session status = setup, else 409)
   POST   /sessions/{id}/documents        multipart; 202 {document_id, status: queued}
@@ -323,7 +331,7 @@ Exams
 
 | Kind | Covers | Runs |
 |---|---|---|
-| Unit (`tests/unit`) | Chunkers (slide, page, past-exam question split), parsers and scan detection, topic name normalization and cleanup, Gemini retries, deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
+| Unit (`tests/unit`) | Chunkers (slide, page), past-exam structure cleanup and exam-profile math, parsers and scan detection, topic name normalization and cleanup, Gemini retries, deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
 | API (`tests/api`) | Auth; **user A can't access user B's data**; session lock 409s; answer key hidden before grading; chat lock | Every push, against Postgres/Redis/Qdrant in Docker |
 | Test isolation | API tests use database `study_test`, Redis DB 15, bucket `<S3_BUCKET>-test` and Qdrant collection `<collection>__test` (set in `tests/conftest.py`), so they never touch dev data. They never call Gemini (fake embedder) or the real job queue | — |
 | Agent evals (`tests/evals`) | Monopoly sample course: ExamWriter produces a valid exam whose sources point to real chunks; Grader scores known-good answers high and known-bad answers low; LLM-as-judge for quality | Manually (costs API calls) |
@@ -407,7 +415,7 @@ Each step ends with something runnable.
 
 - [x] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
 - [x] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
-- [ ] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam question splitting, hybrid search.
+- [ ] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam structure (question types and points) + exam profile, hybrid search.
 - [ ] **4. ExamWriter** + its tools + exam schema (try it via a script or `adk web`).
 - [ ] **5. Grader**, MCQ grading, attempts, topic scores.
 - [ ] **6. StudyCoach** + streaming chat endpoint + chat lock + rate limits.
