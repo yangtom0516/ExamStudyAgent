@@ -5,29 +5,37 @@ stores the file, creates a `queued` document row and puts a job on the queue.
 """
 
 import asyncio
+import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from redis.asyncio import Redis
 from sqlalchemy import select
-
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import (
+    CurrentUser,
     DbSession,
     OwnedDocument,
     OwnedSession,
     SettingsDep,
     StorageDep,
     VectorsDep,
+    lock_session,
     require_setup,
 )
 from app.db.models import Document, DocumentKind, DocumentStatus, StudySession
+from app.services import progress
 from app.services.storage import document_key
 from app.worker.celery_app import enqueue_ingest
+
+SSE_HEARTBEAT_SECONDS = 15.0
 
 router = APIRouter(tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -89,7 +97,7 @@ async def upload_document(
     kind: Annotated[DocumentKind, Form()] = DocumentKind.LECTURE,
 ):
     """Store the file and queue it for processing. Returns 202: processing happens in the background."""
-    require_setup(study_session)
+    require_setup(study_session)  # quick early answer; checked again under the lock below
 
     filename = _clean_filename(file.filename)
     extension = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
@@ -114,23 +122,28 @@ async def upload_document(
             status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"File content is not a valid {extension[1:].upper()}"
         )
 
+    # The slow part (sending the file to storage) happens before taking the lock, so a Start
+    # request isn't kept waiting while a 50 MB file uploads.
     document_id = uuid.uuid4()
     key = document_key(study_session.id, document_id, extension)
     await storage.upload(key, file.file, content_type)
 
-    document = Document(
-        id=document_id,
-        session_id=study_session.id,
-        filename=filename,
-        storage_key=key,
-        kind=kind,
-        status=DocumentStatus.QUEUED,
-        size_bytes=size,
-    )
-    db.add(document)
     try:
-        await db.commit()
+        # The session may have been started while the file was uploading: check again, locked.
+        require_setup(await lock_session(db, study_session.id))
+        document = Document(
+            id=document_id,
+            session_id=study_session.id,
+            filename=filename,
+            storage_key=key,
+            kind=kind,
+            status=DocumentStatus.QUEUED,
+            size_bytes=size,
+        )
+        db.add(document)
+        await db.commit()  # also releases the lock
     except Exception:
+        await db.rollback()
         await storage.delete(key)  # don't leave a file with no row pointing at it
         raise
     await db.refresh(document)
@@ -156,8 +169,7 @@ async def list_documents(study_session: OwnedSession, db: DbSession):
 )
 async def retry_document(document: OwnedDocument, db: DbSession):
     """Queue a failed document for processing again."""
-    study_session = await db.get(StudySession, document.session_id)
-    require_setup(study_session)
+    require_setup(await lock_session(db, document.session_id))
     if document.status != DocumentStatus.FAILED:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only failed documents can be retried")
 
@@ -172,8 +184,7 @@ async def retry_document(document: OwnedDocument, db: DbSession):
 async def delete_document(
     document: OwnedDocument, db: DbSession, storage: StorageDep, vectors: VectorsDep
 ) -> None:
-    study_session = await db.get(StudySession, document.session_id)
-    require_setup(study_session)
+    require_setup(await lock_session(db, document.session_id))
 
     document_id, key = document.id, document.storage_key
     await db.delete(document)  # its pages go too (ON DELETE CASCADE)
@@ -187,3 +198,60 @@ async def delete_document(
         await storage.delete(key)
     except Exception:
         logger.exception("Could not delete stored file %s", key)
+
+
+# --- live progress (SSE) -----------------------------------------------------------
+
+
+@router.get("/sessions/{session_id}/events")
+async def session_events(study_session: OwnedSession, user: CurrentUser, request: Request, db: DbSession):
+    """Server-Sent Events: a snapshot of the session's documents, then live progress events.
+
+    The browser opens this once (`new EventSource(url)`) and keeps it open.
+    """
+    # The stream can stay open for minutes: give back the database connection used for the
+    # ownership check now instead of holding it until the browser disconnects.
+    await db.close()
+    state = request.app.state
+    return StreamingResponse(
+        event_stream(state.redis, state.db_sessionmaker, user.id, study_session.id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # don't buffer the stream
+    )
+
+
+async def event_stream(
+    redis: Redis,
+    sessionmaker: async_sessionmaker,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+    heartbeat_seconds: float = SSE_HEARTBEAT_SECONDS,
+) -> AsyncIterator[str]:
+    pubsub = redis.pubsub()
+    # Subscribe *before* reading the snapshot, so an event published in between isn't missed.
+    await pubsub.subscribe(progress.channel(user_id))
+    try:
+        async with sessionmaker() as db:
+            study_session = await db.get(StudySession, session_id)
+            documents = await db.scalars(
+                select(Document).where(Document.session_id == session_id).order_by(Document.created_at, Document.id)
+            )
+            snapshot = {
+                "session": {"id": str(session_id), "status": study_session.status if study_session else None},
+                "documents": [DocumentOut.model_validate(d).model_dump(mode="json") for d in documents],
+            }
+        yield progress.sse("snapshot", snapshot)
+
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=heartbeat_seconds)
+            if message is None:
+                yield progress.SSE_HEARTBEAT  # nothing happened for a while
+                continue
+            event = json.loads(message["data"])
+            # The channel carries all of this user's sessions; forward only this one's.
+            if event.get("session_id") == str(session_id):
+                yield progress.sse("progress", event)
+    finally:
+        # Runs when the browser disconnects (the server cancels this generator).
+        await pubsub.unsubscribe()
+        await pubsub.aclose()

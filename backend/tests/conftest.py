@@ -137,14 +137,25 @@ def enqueued(monkeypatch) -> list[str]:
 
 
 @pytest.fixture
-def run_ingest(client):
+def published() -> list[dict]:
+    """Progress events the pipeline broadcast during this test (via run_ingest), in order."""
+    return []
+
+
+@pytest.fixture
+def run_ingest(client, published):
     """Run the ingestion pipeline for a document right here (what the worker would do),
-    with a fake embedder instead of Gemini: run_ingest(document_id)."""
+    with a fake embedder instead of Gemini: run_ingest(document_id).
+    Progress events are recorded in `published` instead of going to Redis."""
+
+    async def record(user_id, event) -> None:
+        published.append(event)
 
     def _run(document_id: str, embedder=None) -> None:
         async def _go() -> None:
             settings = get_settings()
-            async with pipeline.open_deps(settings, embedder or FakeEmbedder(settings.embed_dimensions)) as deps:
+            embedder_ = embedder or FakeEmbedder(settings.embed_dimensions)
+            async with pipeline.open_deps(settings, embedder_, publish=record) as deps:
                 await pipeline.ingest_document(uuid.UUID(document_id), deps)
 
         asyncio.run(_go())

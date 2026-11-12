@@ -1,16 +1,17 @@
-"""Study sessions. A session starts in `setup` (files can change); starting it is added in step 2d."""
+"""Study sessions. A session starts in `setup` (files can change); Start makes it `active`
+(files locked for good; chat and exams allowed)."""
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, StringConstraints
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.api.deps import DbSession, OwnedCourse, OwnedSession, StorageDep, VectorsDep
-from app.db.models import SessionStatus, StudySession
+from app.api.deps import DbSession, OwnedCourse, OwnedSession, StorageDep, VectorsDep, lock_session
+from app.db.models import Document, DocumentStatus, SessionStatus, StudySession
 from app.services.storage import Storage, session_prefix
 from app.services.vectors import VectorStore
 
@@ -58,6 +59,40 @@ async def create_session(body: SessionCreate, course: OwnedCourse, db: DbSession
 
 @router.get("/sessions/{session_id}", response_model=SessionOut)
 async def get_session(study_session: OwnedSession):
+    return study_session
+
+
+def _files(n: int) -> str:
+    return f"{n} file" if n == 1 else f"{n} files"
+
+
+@router.post("/sessions/{session_id}/start", response_model=SessionOut)
+async def start_session(study_session: OwnedSession, db: DbSession):
+    """Lock the file list and allow chat/exams. Only when there's at least one file and all are ready.
+
+    The UI disables the button until then; this re-check is the guarantee (stale tabs, direct API calls).
+    """
+    study_session = await lock_session(db, study_session.id)  # no upload/delete can slip in meanwhile
+    if study_session.status != SessionStatus.SETUP:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Session already started")
+
+    rows = await db.execute(
+        select(Document.status, func.count()).where(Document.session_id == study_session.id).group_by(Document.status)
+    )
+    counts: dict[str, int] = dict(rows.all())
+    total = sum(counts.values())
+    failed = counts.get(DocumentStatus.FAILED, 0)
+    not_ready = total - counts.get(DocumentStatus.READY, 0) - failed
+    if total == 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Upload at least one file first")
+    if failed:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{_files(failed)} failed; retry or delete them first")
+    if not_ready:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{_files(not_ready)} still processing")
+
+    study_session.status = SessionStatus.ACTIVE
+    study_session.started_at = datetime.now(UTC)
+    await db.commit()
     return study_session
 
 

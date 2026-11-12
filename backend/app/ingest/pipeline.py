@@ -2,8 +2,11 @@
 
 Safe to run more than once for the same document (Celery may deliver a job twice, e.g. after
 a worker crash): pages are replaced, not added, and Qdrant point IDs are deterministic.
+
+Each stage is broadcast as a progress event (see services/progress.py) for the live UI.
 """
 
+import functools
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -12,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from qdrant_client import AsyncQdrantClient, models
+from redis.asyncio import Redis
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -21,6 +25,7 @@ from app.db.models import Course, Document, DocumentStatus, Page, PageSource, St
 from app.ingest.chunking import chunk_pages
 from app.ingest.embedding import Embedder, GeminiEmbedder
 from app.ingest.parsers import UnreadableFileError, parse_document
+from app.services import progress
 from app.services.storage import Storage
 from app.services.vectors import DENSE, VectorStore, chunk_point_id
 
@@ -40,13 +45,17 @@ class IngestDeps:
     storage: Storage
     vectors: VectorStore
     embedder: Embedder
+    publish: progress.Publisher
 
 
 @asynccontextmanager
-async def open_deps(settings: Settings, embedder: Embedder | None = None) -> AsyncIterator[IngestDeps]:
+async def open_deps(
+    settings: Settings, embedder: Embedder | None = None, publish: progress.Publisher | None = None
+) -> AsyncIterator[IngestDeps]:
     # NullPool: each Celery job runs in its own event loop, so don't keep connections between jobs.
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     qdrant = AsyncQdrantClient(url=settings.qdrant_url)
+    redis = Redis.from_url(settings.redis_url)
     try:
         vectors = VectorStore(qdrant, settings.collection_name, settings.embed_dimensions)
         await vectors.ensure_collection()
@@ -55,8 +64,10 @@ async def open_deps(settings: Settings, embedder: Embedder | None = None) -> Asy
             storage=Storage(settings),
             vectors=vectors,
             embedder=embedder or GeminiEmbedder(settings),
+            publish=publish or functools.partial(progress.publish, redis),
         )
     finally:
+        await redis.aclose()
         await qdrant.close()
         await engine.dispose()
 
@@ -82,16 +93,24 @@ async def ingest_document(document_id: uuid.UUID, deps: IngestDeps) -> None:
     job = await _start(document_id, deps)
     if job is None:
         return
+    await _report(job, deps, progress.PARSING)
     try:
         await _process(job, deps)
     except UnreadableFileError as exc:
         logger.info("Document %s can't be read: %s", document_id, exc)
-        await _finish(job, deps, DocumentStatus.FAILED, str(exc))
+        if await _finish(job, deps, DocumentStatus.FAILED, str(exc)):
+            await _report(job, deps, progress.FAILED, error=str(exc))
     except Exception:
         if not await _finish(job, deps, DocumentStatus.FAILED, GENERIC_ERROR):
             logger.info("Document %s was deleted during processing", document_id)
             return
+        await _report(job, deps, progress.FAILED, error=GENERIC_ERROR)
         raise  # unexpected: let Celery log the full error
+
+
+async def _report(job: _Job, deps: IngestDeps, stage: str, **extra) -> None:
+    event = {"document_id": str(job.document_id), "session_id": str(job.session_id), "stage": stage, **extra}
+    await deps.publish(job.user_id, event)
 
 
 async def _start(document_id: uuid.UUID, deps: IngestDeps) -> _Job | None:
@@ -145,6 +164,7 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     chunks = chunk_pages(pages, slides=job.extension == ".pptx")
     if not chunks:
         raise UnreadableFileError(NO_TEXT_ERROR)
+    await _report(job, deps, progress.INDEXING, page_count=len(pages))
     title = PurePosixPath(job.filename).stem
     vectors = await deps.embedder.embed_documents([c.text for c in chunks], title=title)
 
@@ -174,8 +194,9 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     await deps.vectors.upsert(points)
 
     # 5. Done.
-    await _finish(job, deps, DocumentStatus.READY, None)
-    logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
+    if await _finish(job, deps, DocumentStatus.READY, None):
+        await _report(job, deps, progress.READY, page_count=len(pages), chunk_count=len(chunks))
+        logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
 
 
 async def _finish(job: _Job, deps: IngestDeps, status: DocumentStatus, error: str | None) -> bool:

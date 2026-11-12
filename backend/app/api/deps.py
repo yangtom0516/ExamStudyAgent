@@ -80,6 +80,26 @@ def require_setup(study_session: StudySession) -> None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Session already started; its files are locked")
 
 
+async def lock_session(db: AsyncSession, session_id: uuid.UUID) -> StudySession:
+    """Lock the session's row until this transaction commits or rolls back (SELECT ... FOR UPDATE),
+    and return its current state.
+
+    Upload, delete, retry and start all take this lock before checking the session's status, so
+    they run one at a time per session and a check can't go stale before the change is saved
+    (e.g. a file being added just as the session is started). Other sessions aren't affected.
+    """
+    study_session = await db.scalar(
+        select(StudySession)
+        .where(StudySession.id == session_id)
+        .with_for_update()
+        # The row may already be loaded in this request; re-read it now that we hold the lock.
+        .execution_options(populate_existing=True)
+    )
+    if study_session is None:  # deleted in the meantime
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    return study_session
+
+
 def get_storage(request: Request) -> Storage:
     return request.app.state.storage
 

@@ -4,7 +4,7 @@ A multi-user web app where students upload lecture slides and past exams, then c
 
 Built as a portfolio project. Design choices should be defensible in an interview without being overkill: the expected load is a handful of users at once.
 
-**Status:** step 1 (foundation) done; step 2 next (see [Build order](#build-order)).
+**Status:** steps 1 (foundation) and 2 (ingestion) done; step 3 next (see [Build order](#build-order)).
 
 ---
 
@@ -31,7 +31,7 @@ Built as a portfolio project. Design choices should be defensible in an intervie
 - **Course** (e.g. "EECS 281") belongs to one user. It holds **sessions** and the course-wide **topic scores**.
 - **Session** (e.g. "Midterm 1 prep") belongs to a course and **owns its files**.
   - `setup` status: the user uploads and deletes files.
-  - **Start session** is allowed only when every file is `ready`. It sets status to `active`, which **locks the file list for good**.
+  - **Start session** is allowed only when the session has at least one file and every file is `ready` (the UI disables the button until then; the API re-checks). It sets status to `active`, which **locks the file list for good**.
   - `active` status: chat, exams and grading are allowed; uploads and deletes are rejected (HTTP 409).
   - To use different files, the user creates a **new session, which starts empty**. Files are never shared between sessions.
 - **Topics** are extracted from each document and merged into the course's topic list (matched by normalized name). Topic scores are per course, so weak spots carry over between sessions.
@@ -149,7 +149,7 @@ Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks
 
 ## Ingestion pipeline (Celery)
 
-Triggered by `POST /sessions/{id}/documents`: the API saves the file to object storage, creates a `documents` row (`queued`), calls `ingest_document.delay(document_id)`, and returns 202 at once.
+Triggered by `POST /sessions/{id}/documents`: the API saves the file to object storage, creates a `documents` row (`queued`), puts an `ingest_document(document_id)` job on the queue (only the ID travels through Redis; the worker downloads the file itself), and returns 202 at once.
 
 `ingest_document` (queue `ingest`):
 1. Parse PDF/PPTX → pages. Detect pages with no text layer.
@@ -159,7 +159,10 @@ Triggered by `POST /sessions/{id}/documents`: the API saves the file to object s
 5. Chunk (rules above), embed, upsert into Qdrant.
 6. Mark the document `ready`.
 
-Progress events are published at each step to Redis channel `progress:{user_id}` and forwarded to the browser by `GET /sessions/{id}/events` (SSE).
+Progress events are published at each step to Redis channel `progress:{user_id}` (pub/sub, `services/progress.py`) and forwarded to the browser by `GET /sessions/{id}/events` (SSE):
+- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`). Step 3 adds `reading scans`.
+- The stream first sends a `snapshot` event (session status + every document, from Postgres), then `progress` events for that session only, and a `: ping` comment every 15 s when idle. Pub/sub stores nothing, so the snapshot is what makes late or reconnecting browsers correct; Postgres stays the source of truth.
+- The stream subscribes before reading the snapshot, so no event falls in the gap. Publishing never fails a job.
 
 Celery settings and rules:
 - `acks_late=True`, `task_reject_on_worker_lost=True`, `worker_prefetch_multiplier=1` (at-least-once delivery, one job at a time per worker process).
@@ -254,7 +257,7 @@ Sessions
   POST   /courses/{id}/sessions          {name} → status=setup
   GET    /sessions/{id}
   DELETE /sessions/{id}                  cascades
-  POST   /sessions/{id}/start            409 unless every document is ready → status=active
+  POST   /sessions/{id}/start            409 unless ≥1 document and every document is ready → status=active
 
 Documents (only while session status = setup, else 409)
   POST   /sessions/{id}/documents        multipart; 202 {document_id, status: queued}
@@ -276,6 +279,7 @@ Exams
 
 ### Concurrency rules
 
+- **Session row lock for file changes:** upload, delete, retry and start take `SELECT … FOR UPDATE` on the session row (`lock_session` in `api/deps.py`) and re-check the status while holding it, so a file can't be added as the session is being started (check-then-act race). Uploads send the file to storage *before* taking the lock, so the lock is held for milliseconds; if the re-check fails, the stored file is deleted.
 - **One agent turn at a time per session:** Redis lock `chatlock:{session_id}` (`SET NX` with 5-minute TTL). A second request gets 409 "busy". The TTL means a crashed server can't leave a chat locked forever.
 - **Rate limits** in Redis per user (e.g. 20 agent turns/hour, upload limits) → 429 with a friendly message. Stricter limits for the demo account.
 - Run the API with several Uvicorn workers; agent turns are async and mostly wait on network I/O.
@@ -300,7 +304,7 @@ Exams
 
 | Situation | Behavior |
 |---|---|
-| Gemini 429 / 5xx / timeout during ingestion | Celery retry with backoff, then `failed` + Retry button |
+| Gemini 429 / 5xx / timeout during ingestion | Retried per API call with backoff (or Google's `retryDelay`), then `failed` + Retry button |
 | Corrupt or password-protected file | Fail immediately, clear message |
 | Worker crash mid-job | Redelivered (`acks_late`); idempotent upserts prevent duplicates |
 | Error during an agent turn | SSE `error` event, chat unlocks, nothing half-saved |
@@ -317,7 +321,7 @@ Exams
 |---|---|---|
 | Unit (`tests/unit`) | Chunkers (slide, page, past-exam question split), deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
 | API (`tests/api`) | Auth; **user A can't access user B's data**; session lock 409s; answer key hidden before grading; chat lock | Every push, against Postgres/Redis/Qdrant in Docker |
-| Test isolation | API tests use database `study_test`, Redis DB 15 and bucket `<S3_BUCKET>-test` (set in `tests/conftest.py`), so they never touch dev data | — |
+| Test isolation | API tests use database `study_test`, Redis DB 15, bucket `<S3_BUCKET>-test` and Qdrant collection `<collection>__test` (set in `tests/conftest.py`), so they never touch dev data. They never call Gemini (fake embedder) or the real job queue | — |
 | Agent evals (`tests/evals`) | Monopoly sample course: ExamWriter produces a valid exam whose sources point to real chunks; Grader scores known-good answers high and known-bad answers low; LLM-as-judge for quality | Manually (costs API calls) |
 
 ---
@@ -396,7 +400,7 @@ One repository on purpose: agents share models, services and config with the API
 Each step ends with something runnable.
 
 - [x] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
-- [ ] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
+- [x] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
 - [ ] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam question splitting, hybrid search.
 - [ ] **4. ExamWriter** + its tools + exam schema (try it via a script or `adk web`).
 - [ ] **5. Grader**, MCQ grading, attempts, topic scores.
