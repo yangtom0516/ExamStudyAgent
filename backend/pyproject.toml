@@ -15,6 +15,11 @@ dependencies = [
     "redis>=5.2",
     "qdrant-client>=1.12",
     "boto3>=1.35",
+    "python-multipart>=0.0.20",  # lets FastAPI read file uploads (multipart/form-data)
+    "celery[redis]>=5.5",  # background jobs (file ingestion), Redis as the broker
+    "google-genai>=1.30",  # Gemini API: embeddings now; OCR, topics and agents later
+    "pypdf[crypto]>=5.0",  # PDF text; [crypto] reads AES-encrypted PDFs that have no password
+    "python-pptx>=1.0",  # PowerPoint slide text and speaker notes
 ]
 
 [dependency-groups]
