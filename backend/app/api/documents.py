@@ -1,9 +1,10 @@
 """Uploading and managing a session's files (PDF / PPTX). Files can only change while the session is in setup.
 
-Reading the files (parsing, chunking, indexing) happens later in the Celery worker; an upload
-only stores the file and creates a `queued` document row.
+Reading the files (parsing, chunking, indexing) happens in the Celery worker; an upload only
+stores the file, creates a `queued` document row and puts a job on the queue.
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -13,9 +14,20 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
-from app.api.deps import DbSession, OwnedDocument, OwnedSession, SettingsDep, StorageDep, require_setup
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import (
+    DbSession,
+    OwnedDocument,
+    OwnedSession,
+    SettingsDep,
+    StorageDep,
+    VectorsDep,
+    require_setup,
+)
 from app.db.models import Document, DocumentKind, DocumentStatus, StudySession
 from app.services.storage import document_key
+from app.worker.celery_app import enqueue_ingest
 
 router = APIRouter(tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -49,6 +61,18 @@ def _clean_filename(raw: str | None) -> str:
     if not name:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "File has no name")
     return name[-255:]
+
+
+async def _queue_for_ingestion(document: Document, db: AsyncSession) -> None:
+    """Send the ingestion job. If the queue (Redis) is down, mark the document failed so the
+    user sees it and can press Retry, instead of it waiting in `queued` forever."""
+    try:
+        await asyncio.to_thread(enqueue_ingest, document.id)  # the Celery client is blocking
+    except Exception:
+        logger.exception("Could not queue document %s for ingestion", document.id)
+        document.status = DocumentStatus.FAILED
+        document.error = "Couldn't start processing this file. Press Retry to try again."
+        await db.commit()
 
 
 @router.post(
@@ -111,7 +135,7 @@ async def upload_document(
         raise
     await db.refresh(document)
 
-    # TODO(step 2c): ingest_document.delay(document.id)
+    await _queue_for_ingestion(document, db)
     return document
 
 
@@ -125,17 +149,41 @@ async def list_documents(study_session: OwnedSession, db: DbSession):
     return documents.all()
 
 
+@router.post(
+    "/documents/{document_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=DocumentOut,
+)
+async def retry_document(document: OwnedDocument, db: DbSession):
+    """Queue a failed document for processing again."""
+    study_session = await db.get(StudySession, document.session_id)
+    require_setup(study_session)
+    if document.status != DocumentStatus.FAILED:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only failed documents can be retried")
+
+    document.status = DocumentStatus.QUEUED
+    document.error = None
+    await db.commit()
+    await _queue_for_ingestion(document, db)
+    return document
+
+
 @router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_document(document: OwnedDocument, db: DbSession, storage: StorageDep) -> None:
+async def delete_document(
+    document: OwnedDocument, db: DbSession, storage: StorageDep, vectors: VectorsDep
+) -> None:
     study_session = await db.get(StudySession, document.session_id)
     require_setup(study_session)
 
-    key = document.storage_key
-    await db.delete(document)
+    document_id, key = document.id, document.storage_key
+    await db.delete(document)  # its pages go too (ON DELETE CASCADE)
     await db.commit()
-    # TODO(step 2c): also delete the document's chunks from Qdrant.
+    # The row is gone, so leftovers are unreachable; log failures rather than fail the request.
+    try:
+        await vectors.delete_document(document_id)
+    except Exception:
+        logger.exception("Could not delete Qdrant chunks of document %s", document_id)
     try:
         await storage.delete(key)
     except Exception:
-        # The row is gone, so the file is unreachable; log it rather than fail the request.
         logger.exception("Could not delete stored file %s", key)

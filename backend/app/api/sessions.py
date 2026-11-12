@@ -9,9 +9,10 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import select
 
-from app.api.deps import DbSession, OwnedCourse, OwnedSession, StorageDep
+from app.api.deps import DbSession, OwnedCourse, OwnedSession, StorageDep, VectorsDep
 from app.db.models import SessionStatus, StudySession
 from app.services.storage import Storage, session_prefix
+from app.services.vectors import VectorStore
 
 router = APIRouter(tags=["sessions"])
 logger = logging.getLogger(__name__)
@@ -61,18 +62,23 @@ async def get_session(study_session: OwnedSession):
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(study_session: OwnedSession, db: DbSession, storage: StorageDep) -> None:
-    """Delete the session, its document rows (ON DELETE CASCADE) and its stored files."""
+async def delete_session(
+    study_session: OwnedSession, db: DbSession, storage: StorageDep, vectors: VectorsDep
+) -> None:
+    """Delete the session, its rows (ON DELETE CASCADE), stored files and Qdrant chunks."""
     session_id = study_session.id
     await db.delete(study_session)
     await db.commit()
-    # TODO(step 2c): also delete the session's chunks from Qdrant.
-    await delete_session_files(storage, [session_id])
+    await delete_session_data(storage, vectors, [session_id])
 
 
-async def delete_session_files(storage: Storage, session_ids: list[uuid.UUID]) -> None:
-    """Remove stored files after the rows are gone. Failures are logged, not raised:
-    the rows no longer point at the files, so leftovers are harmless clutter."""
+async def delete_session_data(storage: Storage, vectors: VectorStore, session_ids: list[uuid.UUID]) -> None:
+    """Remove stored files and Qdrant chunks after the rows are gone. Failures are logged, not
+    raised: nothing points at the leftovers any more, so they're harmless clutter."""
+    try:
+        await vectors.delete_sessions(session_ids)
+    except Exception:
+        logger.exception("Could not delete Qdrant chunks of sessions %s", session_ids)
     for session_id in session_ids:
         try:
             await storage.delete_prefix(session_prefix(session_id))

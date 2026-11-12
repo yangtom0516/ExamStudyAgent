@@ -78,6 +78,12 @@ class Storage:
             ExtraArgs={"ContentType": content_type},
         )
 
+    async def download(self, key: str) -> bytes:
+        def _read() -> bytes:
+            return self._client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+
+        return await asyncio.to_thread(_read)
+
     async def exists(self, key: str) -> bool:
         try:
             await asyncio.to_thread(self._client.head_object, Bucket=self.bucket, Key=key)

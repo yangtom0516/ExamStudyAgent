@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api import auth, courses, documents, health, sessions
 from app.config import get_settings
 from app.services.storage import Storage
+from app.services.vectors import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,17 @@ async def lifespan(app: FastAPI):
     app.state.redis = Redis.from_url(settings.redis_url, decode_responses=True)
     app.state.qdrant = AsyncQdrantClient(url=settings.qdrant_url)
     app.state.storage = Storage(settings)
+    app.state.vectors = VectorStore(app.state.qdrant, settings.collection_name, settings.embed_dimensions)
 
+    # Don't crash on startup if a store is down; /health will report it as failing.
     try:
         await app.state.storage.ensure_bucket()
     except Exception:
-        # Don't crash on startup; /health will report storage as failing.
         logger.exception("Could not create storage bucket %r", settings.s3_bucket)
+    try:
+        await app.state.vectors.ensure_collection()
+    except Exception:
+        logger.exception("Could not create Qdrant collection %r", settings.collection_name)
 
     yield
 

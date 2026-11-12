@@ -4,7 +4,17 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -87,3 +97,29 @@ class Document(Base):
     page_count: Mapped[int | None] = mapped_column(Integer)
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PageSource(StrEnum):
+    TEXT = "text"  # read from the file's text layer
+    OCR = "ocr"  # scanned page, read by Gemini vision (step 3)
+
+
+class Page(Base):
+    """Extracted text of one PDF page or one slide.
+
+    Kept so the Qdrant index can be rebuilt (e.g. with a new embedding model) without
+    re-uploading files or re-running OCR. Empty `text` means no text layer (a scan).
+    """
+
+    __tablename__ = "pages"
+    __table_args__ = (
+        UniqueConstraint("document_id", "page_number"),
+        CheckConstraint("source IN ('text', 'ocr')", name="source"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # No separate index needed: the unique constraint's index starts with document_id.
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    page_number: Mapped[int] = mapped_column(Integer)  # 1-based, as shown in PDF viewers
+    text: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(10), default=PageSource.TEXT, server_default="text")

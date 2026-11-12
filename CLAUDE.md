@@ -126,7 +126,8 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 
 ## Knowledge base (Qdrant)
 
-- One collection per embedding model, e.g. `chunks__<embed-model-slug>`. The active collection name comes from config. Re-embedding = build a new collection from `pages`, then switch config.
+- One collection per embedding model and vector size, e.g. `chunks__gemini-embedding-2__768`. The active collection name comes from config. Re-embedding = build a new collection from `pages`, then switch config.
+- Embeddings: `gemini-embedding-2` at 768 dimensions, cosine distance. This model takes the task as a text prefix: chunks are embedded as `title: <file name> | text: <chunk>`, queries as `task: search result | query: <query>`.
 - Each point: dense vector + sparse (keyword) vector + payload `{user_id, course_id, session_id, document_id, kind, page_number, chunk_index, topics[], text}`.
 - Payload indexes on `user_id`, `session_id`, `kind`.
 - **Every search filters on `user_id` + `session_id`.** The filter is applied inside the search service, never chosen by the LLM.
@@ -163,7 +164,9 @@ Progress events are published at each step to Redis channel `progress:{user_id}`
 Celery settings and rules:
 - `acks_late=True`, `task_reject_on_worker_lost=True`, `worker_prefetch_multiplier=1` (at-least-once delivery, one job at a time per worker process).
 - **Tasks must be idempotent** (they may run twice).
-- Retry Gemini 429/5xx/timeouts with exponential backoff (2, 4, 8, 16, 32 s; max 5). After that: `failed` + error message; the user can `POST /documents/{id}/retry`.
+- Retry Gemini 429/5xx/timeouts with exponential backoff (2, 4, 8, 16, 32 s; max 5), **per API call** (`services/gemini.py`), so a rate limit halfway through a document doesn't redo the batches that already succeeded. When a 429 says how long to wait (`retryDelay`, e.g. until the free tier's per-minute quota resets), wait that long instead (capped at 90 s). After that: `failed` + error message; the user can `POST /documents/{id}/retry`.
+- If the queue can't be reached at upload time, the document is marked `failed` ("press Retry") instead of staying `queued` forever.
+- A document deleted while it's being processed is detected at the end, and any chunks just written for it are removed.
 - Corrupt or password-protected files fail immediately without retry.
 
 ---
@@ -327,8 +330,9 @@ COACH_MODEL=            # Gemini model names from Google AI Studio
 EXAM_MODEL=
 GRADER_MODEL=
 OCR_MODEL=
-EMBED_MODEL=
-QDRANT_COLLECTION=      # derived from EMBED_MODEL if empty
+EMBED_MODEL=gemini-embedding-2
+EMBED_DIMENSIONS=768
+QDRANT_COLLECTION=      # derived from EMBED_MODEL + EMBED_DIMENSIONS if empty
 POSTGRES_PASSWORD=
 DATABASE_URL=postgresql+asyncpg://study:${POSTGRES_PASSWORD}@postgres:5432/study
 REDIS_URL=redis://redis:6379/0
@@ -344,6 +348,7 @@ JWT_SECRET=
 ## Deployment
 
 - **Local:** `docker compose up -d` → web at http://localhost:3000, Qdrant dashboard at http://localhost:6333/dashboard, Flower at http://localhost:5555.
+- **Local, before the app services are containerized:** `docker compose up -d` runs only the data stores. From `backend/`, run the API with `uv run uvicorn app.main:app --reload` and the worker with `uv run celery -A app.worker.celery_app worker -Q ingest -P solo --loglevel=info` (`-P solo` because Celery's default process pool doesn't work on Windows). SeaweedFS's file browser is at http://localhost:8888/buckets/ (local only).
 - **Cloud demo:** one VM (~4 GB RAM minimum) running the same compose file plus `caddy` for HTTPS; domain optional (a free subdomain works).
 - **Demo account** preloaded with the Monopoly sample course (`data/samples/`).
 - Nightly `pg_dump` backup. Qdrant is rebuildable from `pages`.
@@ -406,5 +411,5 @@ Backend first (1–6) so the hard parts work before any UI exists.
 
 ## Open items
 
-- **Models:** the user has a Google AI Studio key; choose specific Gemini models for coach / exam / grader / OCR / embeddings and put them in `.env`.
+- **Models:** embeddings use `gemini-embedding-2` (768 dims). Still to choose: Gemini models for coach / exam / grader / OCR.
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.

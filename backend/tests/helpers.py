@@ -1,8 +1,92 @@
-"""Small helpers shared by API tests."""
+"""Small helpers shared by tests."""
 
-# Minimal files that pass the "first bytes" check. They aren't real documents; parsing comes in step 2c.
+import io
+
+from pptx import Presentation
+from pptx.util import Inches
+
+# Minimal files that pass the upload's "first bytes" check, for tests that never parse them.
 PDF_BYTES = b"%PDF-1.4\n% tiny test file\n"
 PPTX_BYTES = b"PK\x03\x04" + b"\x00" * 26
+
+
+def make_pdf(page_texts: list[str]) -> bytes:
+    """A small but real PDF with one line of text per page. "" makes a page with no text (like a scan)."""
+    font = 3
+    bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>"
+        % (" ".join(f"{4 + 2 * i} 0 R" for i in range(len(page_texts))).encode(), len(page_texts)),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for i, text in enumerate(page_texts):
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1") if text else b""
+        bodies.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>" % (font, 5 + 2 * i)
+        )
+        bodies.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(bodies, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref_at = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(bodies) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(bodies) + 1, xref_at)
+    return bytes(out)
+
+
+def make_encrypted_pdf(password: str = "secret") -> bytes:
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(make_pdf(["Top secret notes"]))))
+    writer.encrypt(user_password=password, algorithm="AES-256")
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def make_pptx(slides: list[tuple[str, str, str]]) -> bytes:
+    """A real PPTX. Each slide is (title, body, speaker notes); use "" to leave a part out."""
+    presentation = Presentation()
+    layout = presentation.slide_layouts[1]  # "Title and Content"
+    for title, body, notes in slides:
+        slide = presentation.slides.add_slide(layout)
+        slide.shapes.title.text = title
+        slide.placeholders[1].text = body
+        if notes:
+            slide.notes_slide.notes_text_frame.text = notes
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
+
+
+def make_pptx_with_table(rows: list[list[str]]) -> bytes:
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])  # blank
+    table = slide.shapes.add_table(len(rows), len(rows[0]), Inches(1), Inches(1), Inches(6), Inches(2)).table
+    for r, row in enumerate(rows):
+        for c, value in enumerate(row):
+            table.cell(r, c).text = value
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
+
+
+class FakeEmbedder:
+    """Stands in for Gemini: returns a fixed vector per text and remembers what it was asked."""
+
+    def __init__(self, dimensions: int) -> None:
+        self.dimensions = dimensions
+        self.calls: list[tuple[list[str], str]] = []
+
+    async def embed_documents(self, texts: list[str], title: str) -> list[list[float]]:
+        self.calls.append((texts, title))
+        return [[1.0] + [0.0] * (self.dimensions - 1) for _ in texts]
 
 
 def create_course(client, name="EECS 281") -> dict:
