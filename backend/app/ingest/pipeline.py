@@ -1,4 +1,5 @@
-"""Ingest one document: download -> parse -> save pages -> chunk -> embed -> index in Qdrant -> ready.
+"""Ingest one document: download -> parse -> OCR scanned pages -> save pages -> chunk -> embed ->
+index in Qdrant -> ready.
 
 Safe to run more than once for the same document (Celery may deliver a job twice, e.g. after
 a worker crash): pages are replaced, not added, and Qdrant point IDs are deterministic.
@@ -6,6 +7,7 @@ a worker crash): pages are replaced, not added, and Qdrant point IDs are determi
 Each stage is broadcast as a progress event (see services/progress.py) for the live UI.
 """
 
+import dataclasses
 import functools
 import logging
 import uuid
@@ -24,7 +26,8 @@ from app.config import Settings
 from app.db.models import Course, Document, DocumentStatus, Page, PageSource, StudySession
 from app.ingest.chunking import chunk_pages
 from app.ingest.embedding import Embedder, GeminiEmbedder
-from app.ingest.parsers import UnreadableFileError, parse_document
+from app.ingest.ocr import GeminiOcr, PageReader
+from app.ingest.parsers import ParsedPage, UnreadableFileError, parse_document, split_pdf_pages
 from app.services import progress
 from app.services.storage import Storage
 from app.services.vectors import DENSE, VectorStore, chunk_point_id
@@ -32,25 +35,28 @@ from app.services.vectors import DENSE, VectorStore, chunk_point_id
 logger = logging.getLogger(__name__)
 
 GENERIC_ERROR = "Something went wrong while reading this file. Press Retry to try again."
-NO_TEXT_ERROR = (
-    "No text found in this file. It may be scanned images only; reading scans is coming soon."
-)
+NO_TEXT_ERROR = "No readable text found in this file."
 
 
 @dataclass
 class IngestDeps:
-    """Connections the pipeline needs. Tests build it with a fake embedder."""
+    """Connections the pipeline needs. Tests build it with fakes for the Gemini parts."""
 
     sessionmaker: async_sessionmaker
     storage: Storage
     vectors: VectorStore
     embedder: Embedder
+    ocr: PageReader
     publish: progress.Publisher
+    max_ocr_pages: int
 
 
 @asynccontextmanager
 async def open_deps(
-    settings: Settings, embedder: Embedder | None = None, publish: progress.Publisher | None = None
+    settings: Settings,
+    embedder: Embedder | None = None,
+    publish: progress.Publisher | None = None,
+    ocr: PageReader | None = None,
 ) -> AsyncIterator[IngestDeps]:
     # NullPool: each Celery job runs in its own event loop, so don't keep connections between jobs.
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
@@ -64,7 +70,9 @@ async def open_deps(
             storage=Storage(settings),
             vectors=vectors,
             embedder=embedder or GeminiEmbedder(settings),
+            ocr=ocr or GeminiOcr(settings),
             publish=publish or functools.partial(progress.publish, redis),
+            max_ocr_pages=settings.max_ocr_pages,
         )
     finally:
         await redis.aclose()
@@ -149,12 +157,13 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     # 1. Parse the file into pages.
     data = await deps.storage.download(job.storage_key)
     pages = parse_document(data, job.extension)
+    pages = await _read_scans(job, deps, data, pages)
 
     # 2. Save the page texts (replacing any from an earlier run).
     async with deps.sessionmaker() as db:
         await db.execute(delete(Page).where(Page.document_id == job.document_id))
         db.add_all(
-            Page(document_id=job.document_id, page_number=p.number, text=p.text, source=PageSource.TEXT)
+            Page(document_id=job.document_id, page_number=p.number, text=p.text, source=p.source)
             for p in pages
         )
         await db.execute(update(Document).where(Document.id == job.document_id).values(page_count=len(pages)))
@@ -197,6 +206,54 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     if await _finish(job, deps, DocumentStatus.READY, None):
         await _report(job, deps, progress.READY, page_count=len(pages), chunk_count=len(chunks))
         logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
+
+
+async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[ParsedPage]) -> list[ParsedPage]:
+    """OCR the pages flagged as scanned, one Gemini call per page.
+
+    Pages read in an earlier run of this document (e.g. before a later step failed and the user
+    pressed Retry) are reused from the `pages` table instead of being paid for again.
+    """
+    scanned = [p for p in pages if p.needs_ocr]
+    if not scanned:
+        return pages
+    if len(scanned) > deps.max_ocr_pages:
+        raise UnreadableFileError(
+            f"This file has {len(scanned)} scanned pages; at most {deps.max_ocr_pages} can be read "
+            "per file. Split it into smaller files and upload them separately."
+        )
+
+    async with deps.sessionmaker() as db:
+        rows = await db.execute(
+            select(Page.page_number, Page.text).where(
+                Page.document_id == job.document_id, Page.source == PageSource.OCR
+            )
+        )
+        read_before: dict[int, str] = dict(rows.all())
+    to_read = [p.number for p in scanned if p.number not in read_before]
+    page_pdfs = split_pdf_pages(data, to_read)
+
+    texts: dict[int, str] = {}
+    await _report(job, deps, progress.READING_SCANS, pages_done=0, pages_total=len(scanned))
+    for done, page in enumerate(scanned, start=1):
+        if page.number in read_before:
+            texts[page.number] = read_before[page.number]
+        else:
+            texts[page.number] = await deps.ocr.read_page(page_pdfs[page.number])
+        await _report(job, deps, progress.READING_SCANS, pages_done=done, pages_total=len(scanned))
+    logger.info(
+        "Document %s: read %d scanned pages (%d reused from an earlier run)",
+        job.document_id,
+        len(scanned),
+        len(scanned) - len(to_read),
+    )
+
+    return [
+        dataclasses.replace(p, text=texts[p.number], source=PageSource.OCR, needs_ocr=False)
+        if p.number in texts
+        else p
+        for p in pages
+    ]
 
 
 async def _finish(job: _Job, deps: IngestDeps, status: DocumentStatus, error: str | None) -> bool:

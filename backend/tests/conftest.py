@@ -47,7 +47,7 @@ from app.db.base import Base  # noqa: E402
 from app.ingest import pipeline  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.storage import Storage  # noqa: E402
-from tests.helpers import FakeEmbedder  # noqa: E402
+from tests.helpers import FakeEmbedder, FakeOcr  # noqa: E402
 
 
 async def _create_test_database() -> None:
@@ -145,17 +145,17 @@ def published() -> list[dict]:
 @pytest.fixture
 def run_ingest(client, published):
     """Run the ingestion pipeline for a document right here (what the worker would do),
-    with a fake embedder instead of Gemini: run_ingest(document_id).
+    with fakes instead of Gemini: run_ingest(document_id, embedder=..., ocr=...).
     Progress events are recorded in `published` instead of going to Redis."""
 
     async def record(user_id, event) -> None:
         published.append(event)
 
-    def _run(document_id: str, embedder=None) -> None:
+    def _run(document_id: str, embedder=None, ocr=None) -> None:
         async def _go() -> None:
             settings = get_settings()
             embedder_ = embedder or FakeEmbedder(settings.embed_dimensions)
-            async with pipeline.open_deps(settings, embedder_, publish=record) as deps:
+            async with pipeline.open_deps(settings, embedder_, publish=record, ocr=ocr or FakeOcr()) as deps:
                 await pipeline.ingest_document(uuid.UUID(document_id), deps)
 
         asyncio.run(_go())

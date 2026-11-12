@@ -1,6 +1,7 @@
 """Small helpers shared by tests."""
 
 import io
+from collections.abc import Iterable
 
 from pptx import Presentation
 from pptx.util import Inches
@@ -10,9 +11,13 @@ PDF_BYTES = b"%PDF-1.4\n% tiny test file\n"
 PPTX_BYTES = b"PK\x03\x04" + b"\x00" * 26
 
 
-def make_pdf(page_texts: list[str]) -> bytes:
-    """A small but real PDF with one line of text per page. "" makes a page with no text (like a scan)."""
-    font = 3
+def make_pdf(page_texts: list[str], image_pages: Iterable[int] = ()) -> bytes:
+    """A small but real PDF with one line of text per page. "" makes a page with no text.
+
+    Pages listed in `image_pages` (1-based) also draw a full-page image, like a scan does.
+    """
+    font, image = 3, 4 + 2 * len(page_texts)  # object numbers
+    image_pages = set(image_pages)
     bodies = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [%s] /Count %d >>"
@@ -20,13 +25,22 @@ def make_pdf(page_texts: list[str]) -> bytes:
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
     for i, text in enumerate(page_texts):
+        has_image = (i + 1) in image_pages
         escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1") if text else b""
+        stream = b"q 612 0 0 792 0 0 cm /Im1 Do Q\n" if has_image else b""
+        if text:
+            stream += f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1")
+        xobjects = b" /XObject << /Im1 %d 0 R >>" % image if has_image else b""
         bodies.append(
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>" % (font, 5 + 2 * i)
+            b"/Resources << /Font << /F1 %d 0 R >>%s >> /Contents %d 0 R >>" % (font, xobjects, 5 + 2 * i)
         )
         bodies.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
+    # A 1x1 grey pixel stands in for the scanned picture.
+    bodies.append(
+        b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream"
+    )
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -115,3 +129,15 @@ def upload_ok(client, session_id, **kwargs) -> dict:
     response = upload(client, session_id, **kwargs)
     assert response.status_code == 202, response.text
     return response.json()
+
+
+class FakeOcr:
+    """Stands in for Gemini OCR: "reads" every page as the same text and counts the calls."""
+
+    def __init__(self, text: str = "Scanned notes about binary heaps") -> None:
+        self.text = text
+        self.pages: list[bytes] = []  # the one-page PDFs it was given
+
+    async def read_page(self, page_pdf: bytes) -> str:
+        self.pages.append(page_pdf)
+        return self.text

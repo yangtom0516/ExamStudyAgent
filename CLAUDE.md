@@ -141,7 +141,7 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 | PPTX | 1 slide = 1 chunk (slide text + speaker notes) |
 | Lecture/notes PDF | Per page; long pages split recursively (~800 chars, ~80 overlap) |
 | Past exam | 1 question = 1 chunk (so ExamWriter can retrieve real questions by topic) |
-| Scanned / image-only pages | Gemini vision OCR → text, then chunked as above |
+| Scanned / image-only pages | Gemini vision OCR → text, then chunked as above (PDF only for now) |
 
 Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks the extension **and** the file's first bytes (`%PDF-`, or the ZIP signature for PPTX): 415 for other types, 413 if too large, 422 if empty. Files are stored at `sessions/<session_id>/<document_id>.<ext>`, so a session's files are deleted by prefix. The cloud deploy should also cap request bodies in Caddy, since the app only sees the size after the upload has been received.
 
@@ -152,15 +152,15 @@ Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks
 Triggered by `POST /sessions/{id}/documents`: the API saves the file to object storage, creates a `documents` row (`queued`), puts an `ingest_document(document_id)` job on the queue (only the ID travels through Redis; the worker downloads the file itself), and returns 202 at once.
 
 `ingest_document` (queue `ingest`):
-1. Parse PDF/PPTX → pages. Detect pages with no text layer.
-2. OCR those pages with Gemini vision.
+1. Parse PDF/PPTX → pages. Detect scanned pages: a PDF page with **< 20 characters of text and at least one image** (`OCR_MAX_TEXT_CHARS` in `ingest/parsers.py`). Blank pages without images are skipped.
+2. OCR those pages with Gemini (`OCR_MODEL`, default `gemini-3.5-flash-lite`): each page is cut out as a one-page PDF and sent with `ingest/prompts/ocr.md` ("transcribe exactly"). Saved with `source = 'ocr'`. Pages already read in an earlier run of the same document are reused, so a Retry doesn't pay for OCR twice. More than `MAX_OCR_PAGES` (100) scanned pages in one file → `failed` with a "split the file" message.
 3. Save `pages` rows.
 4. Extract topics: **one** LLM call per document → topics with page ranges → merge into course topics.
 5. Chunk (rules above), embed, upsert into Qdrant.
 6. Mark the document `ready`.
 
 Progress events are published at each step to Redis channel `progress:{user_id}` (pub/sub, `services/progress.py`) and forwarded to the browser by `GET /sessions/{id}/events` (SSE):
-- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`). Step 3 adds `reading scans`.
+- Events: `{"document_id", "session_id", "stage", ...}` with stage `parsing` → `reading_scans` (+`pages_done`, `pages_total`; only if the file has scanned pages) → `indexing` (+`page_count`) → `ready` (+`page_count`, `chunk_count`), or `failed` (+`error`).
 - The stream first sends a `snapshot` event (session status + every document, from Postgres), then `progress` events for that session only, and a `: ping` comment every 15 s when idle. Pub/sub stores nothing, so the snapshot is what makes late or reconnecting browsers correct; Postgres stays the source of truth.
 - The stream subscribes before reading the snapshot, so no event falls in the gap. Publishing never fails a job.
 
@@ -293,7 +293,7 @@ Exams
 | Login / Register | Username + password |
 | Courses | List, "+ New course" |
 | Course | Sessions list, "+ New session", topic list colored by score |
-| Session (setup) | Drag-and-drop upload, file list with live progress (`queued → parsing → reading scans → indexing → ready` / failed + Retry), delete, **Start session** (disabled until all ready) |
+| Session (setup) | Drag-and-drop upload, file list with live progress (`queued → parsing → reading scans (3/12) → indexing → ready` / failed + Retry), delete, **Start session** (disabled until all ready) |
 | Session (active) | Locked file list; chat with StudyCoach (input disabled during an agent turn, status lines shown); "Mock exams" tab with scores |
 | Take exam | Questions, radio buttons / text boxes, Submit |
 | Results | Score, ✅/❌ per question, feedback, correct answer, links to source slides/pages |
@@ -333,7 +333,8 @@ GOOGLE_API_KEY=
 COACH_MODEL=            # Gemini model names from Google AI Studio
 EXAM_MODEL=
 GRADER_MODEL=
-OCR_MODEL=
+OCR_MODEL=gemini-3.5-flash-lite
+MAX_OCR_PAGES=100
 EMBED_MODEL=gemini-embedding-2
 EMBED_DIMENSIONS=768
 QDRANT_COLLECTION=      # derived from EMBED_MODEL + EMBED_DIMENSIONS if empty
@@ -415,5 +416,5 @@ Backend first (1–6) so the hard parts work before any UI exists.
 
 ## Open items
 
-- **Models:** embeddings use `gemini-embedding-2` (768 dims). Still to choose: Gemini models for coach / exam / grader / OCR.
+- **Models:** embeddings use `gemini-embedding-2` (768 dims); OCR and other ingestion calls use `gemini-3.5-flash-lite`. Still to choose: coach / exam / grader (likely `gemini-3.8-flash`).
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.
