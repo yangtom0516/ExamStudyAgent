@@ -87,7 +87,7 @@ users          id, username (unique, 3–30 chars), password_hash, created_at
 courses        id, user_id → users, name, created_at
 study_sessions id, course_id → courses, name, status (setup | active), started_at, created_at
 documents      id, session_id → study_sessions, filename, storage_key, kind (lecture | past_exam | notes),
-               status (queued | processing | ready | failed), error, page_count, created_at
+               status (queued | processing | ready | failed), error, page_count, size_bytes, created_at
 pages          id, document_id → documents, page_number, text, source (text | ocr)
 topics         id, course_id → courses, name, normalized_name (unique per course)
 document_topics document_id, topic_id, page_start, page_end
@@ -142,7 +142,7 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 | Past exam | 1 question = 1 chunk (so ExamWriter can retrieve real questions by topic) |
 | Scanned / image-only pages | Gemini vision OCR → text, then chunked as above |
 
-Accepted uploads: PDF and PPTX, max 50 MB each.
+Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks the extension **and** the file's first bytes (`%PDF-`, or the ZIP signature for PPTX): 415 for other types, 413 if too large, 422 if empty. Files are stored at `sessions/<session_id>/<document_id>.<ext>`, so a session's files are deleted by prefix. The cloud deploy should also cap request bodies in Caddy, since the app only sees the size after the upload has been received.
 
 ---
 

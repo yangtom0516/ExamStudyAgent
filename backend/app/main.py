@@ -12,7 +12,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api import auth, courses, health, sessions
+from app.api import auth, courses, documents, health, sessions
 from app.config import get_settings
 from app.services.storage import Storage
 
@@ -48,3 +48,4 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(courses.router)
 app.include_router(sessions.router)
+app.include_router(documents.router)

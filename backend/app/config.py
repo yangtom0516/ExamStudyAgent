@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     s3_access_key: str
     s3_secret_key: SecretStr
     s3_bucket: str
+    max_upload_mb: int = 50
 
     # Auth
     jwt_secret: SecretStr  # required

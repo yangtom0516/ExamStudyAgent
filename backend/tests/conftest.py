@@ -62,6 +62,13 @@ async def _truncate_all_tables() -> None:
     await engine.dispose()
 
 
+async def _execute(sql: str, params: dict) -> None:
+    engine = create_async_engine(get_settings().database_url)
+    async with engine.begin() as conn:
+        await conn.execute(text(sql), params)
+    await engine.dispose()
+
+
 async def _fetch_one(sql: str, params: dict) -> dict | None:
     engine = create_async_engine(get_settings().database_url)
     async with engine.connect() as conn:
@@ -107,3 +114,18 @@ def login_as(client):
 def db_fetch_one(test_database):
     """Run a SELECT against the test database and return the first row as a dict."""
     return lambda sql, **params: asyncio.run(_fetch_one(sql, params))
+
+
+@pytest.fixture
+def db_execute(test_database):
+    """Run a write statement against the test database, e.g. to set up a state the API can't reach yet."""
+    return lambda sql, **params: asyncio.run(_execute(sql, params))
+
+
+@pytest.fixture
+def stored_file_exists(client):
+    """Check whether a key exists in the test bucket (depends on `client`, whose startup creates the bucket)."""
+    from app.services.storage import Storage
+
+    storage = Storage(get_settings())
+    return lambda key: asyncio.run(storage.exists(key))

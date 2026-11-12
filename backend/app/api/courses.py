@@ -6,8 +6,9 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DbSession, OwnedCourse
-from app.db.models import Course
+from app.api.deps import CurrentUser, DbSession, OwnedCourse, StorageDep
+from app.api.sessions import delete_session_files
+from app.db.models import Course, StudySession
 
 router = APIRouter(prefix="/courses", tags=["courses"])
 
@@ -50,8 +51,10 @@ async def get_course(course: OwnedCourse):
 
 
 @router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_course(course: OwnedCourse, db: DbSession) -> None:
-    """Delete the course and, via ON DELETE CASCADE, its sessions."""
-    # TODO(step 2b/2c): also delete the course's files from storage and its chunks from Qdrant.
+async def delete_course(course: OwnedCourse, db: DbSession, storage: StorageDep) -> None:
+    """Delete the course, its sessions and documents (ON DELETE CASCADE) and their stored files."""
+    session_ids = list(await db.scalars(select(StudySession.id).where(StudySession.course_id == course.id)))
     await db.delete(course)
     await db.commit()
+    # TODO(step 2c): also delete the course's chunks from Qdrant.
+    await delete_session_files(storage, session_ids)

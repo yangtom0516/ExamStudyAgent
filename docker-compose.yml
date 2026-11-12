@@ -68,6 +68,9 @@ services:
       - seaweedfs_data:/data
     ports:
       - "127.0.0.1:8333:8333"   # S3 API
+      # File browser for local debugging: http://localhost:8888/buckets/
+      # It skips the S3 keys, so never expose it on the cloud deploy.
+      - "127.0.0.1:8888:8888"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/status || exit 1"]
       interval: 5s
