@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -29,6 +29,7 @@ from app.config import Settings
 from app.db.models import Course, Document, DocumentKind, DocumentStatus, Page, PageSource, StudySession
 from app.ingest.chunking import chunk_pages
 from app.ingest.embedding import Embedder, GeminiEmbedder
+from app.ingest.indexing import DocumentInfo, index_chunks
 from app.ingest.ocr import GeminiOcr, PageReader
 from app.ingest.parsers import ParsedPage, UnreadableFileError, parse_document, split_pdf_pages
 from app.ingest.past_exams import (
@@ -49,7 +50,7 @@ from app.ingest.topics import (
 )
 from app.services import progress
 from app.services.storage import Storage
-from app.services.vectors import DENSE, VectorStore, chunk_point_id
+from app.services.vectors import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -105,21 +106,7 @@ async def open_deps(
         await engine.dispose()
 
 
-@dataclass(frozen=True)
-class _Job:
-    """What the pipeline needs to know about the document, copied out of the database row."""
-
-    document_id: uuid.UUID
-    session_id: uuid.UUID
-    course_id: uuid.UUID
-    user_id: uuid.UUID
-    filename: str
-    storage_key: str
-    kind: str
-
-    @property
-    def extension(self) -> str:
-        return PurePosixPath(self.storage_key).suffix
+_Job = DocumentInfo  # what the pipeline knows about the document it's processing
 
 
 async def ingest_document(document_id: uuid.UUID, deps: IngestDeps) -> None:
@@ -207,43 +194,18 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     # 4. Topics, so each chunk can be tagged with the topics of its page.
     page_topics = await _find_topics(job, deps, pages, title)
 
-    # 5. Embed.
+    # 5. Embed and index in Qdrant (meaning + keyword vectors).
     await _report(job, deps, progress.INDEXING, page_count=len(pages))
-    vectors = await deps.embedder.embed_documents([c.text for c in chunks], title=title)
+    await index_chunks(job, chunks, page_topics, deps.embedder, deps.vectors)
 
-    # 6. Index in Qdrant. Old points go first, in case an earlier run produced more chunks.
-    payload = {
-        "user_id": str(job.user_id),
-        "course_id": str(job.course_id),
-        "session_id": str(job.session_id),
-        "document_id": str(job.document_id),
-        "kind": job.kind,
-    }
-    points = [
-        models.PointStruct(
-            id=str(chunk_point_id(job.document_id, chunk.page_number, chunk.chunk_index)),
-            vector={DENSE: vector},
-            payload={
-                **payload,
-                "page_number": chunk.page_number,
-                "chunk_index": chunk.chunk_index,
-                "topics": page_topics.get(chunk.page_number, []),  # normalized names
-                "text": chunk.text,
-            },
-        )
-        for chunk, vector in zip(chunks, vectors, strict=True)
-    ]
-    await deps.vectors.delete_document(job.document_id)
-    await deps.vectors.upsert(points)
-
-    # 7. Done.
+    # 6. Done.
     if await _finish(job, deps, DocumentStatus.READY, None):
         await _report(job, deps, progress.READY, page_count=len(pages), chunk_count=len(chunks))
         logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
 
 
 async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[ParsedPage]) -> list[ParsedPage]:
-    """OCR the pages flagged as scanned, one Gemini call per page.
+    """OCR the pages flagged `needs_ocr` (scans, or text in an unreadable font), one Gemini call per page.
 
     Pages read in an earlier run of this document (e.g. before a later step failed and the user
     pressed Retry) are reused from the `pages` table instead of being paid for again.
@@ -253,8 +215,9 @@ async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[Pars
         return pages
     if len(scanned) > deps.max_ocr_pages:
         raise UnreadableFileError(
-            f"This file has {len(scanned)} scanned pages; at most {deps.max_ocr_pages} can be read "
-            "per file. Split it into smaller files and upload them separately."
+            f"This file has {len(scanned)} pages that must be read as images (scanned, or text in an "
+            f"unreadable font); at most {deps.max_ocr_pages} can be read per file. Split it into "
+            "smaller files and upload them separately."
         )
 
     async with deps.sessionmaker() as db:
@@ -276,7 +239,7 @@ async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[Pars
             texts[page.number] = await deps.ocr.read_page(page_pdfs[page.number])
         await _report(job, deps, progress.READING_SCANS, pages_done=done, pages_total=len(scanned))
     logger.info(
-        "Document %s: read %d scanned pages (%d reused from an earlier run)",
+        "Document %s: OCR'd %d pages (%d reused from an earlier run)",
         job.document_id,
         len(scanned),
         len(scanned) - len(to_read),

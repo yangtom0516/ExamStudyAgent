@@ -54,6 +54,12 @@ def make_pdf(page_texts: list[str], image_pages: Iterable[int] = ()) -> bytes:
     return bytes(out)
 
 
+def unreadable_font(text: str) -> str:
+    """`text` as it comes out of a PDF font without a letter table: every character shifted down by
+    29, so "Split Brain" becomes "6SOLW\\x03%UDLQ". Put it in make_pdf to reproduce that bug."""
+    return "".join(chr(ord(c) - 29) for c in text)
+
+
 def make_encrypted_pdf(password: str = "secret") -> bytes:
     from pypdf import PdfReader, PdfWriter
 
@@ -97,10 +103,17 @@ class FakeEmbedder:
     def __init__(self, dimensions: int) -> None:
         self.dimensions = dimensions
         self.calls: list[tuple[list[str], str]] = []
+        self.queries: list[str] = []
 
     async def embed_documents(self, texts: list[str], title: str) -> list[list[float]]:
         self.calls.append((texts, title))
         return [[1.0] + [0.0] * (self.dimensions - 1) for _ in texts]
+
+    async def embed_query(self, query: str) -> list[float]:
+        # The same vector as every chunk: meaning-search can't tell chunks apart in tests, so
+        # whatever ranks first is decided by the keyword half of hybrid search.
+        self.queries.append(query)
+        return [1.0] + [0.0] * (self.dimensions - 1)
 
 
 def create_course(client, name="EECS 281") -> dict:

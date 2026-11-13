@@ -4,7 +4,7 @@ A multi-user web app where students upload lecture slides and past exams, then c
 
 Built as a portfolio project. Design choices should be defensible in an interview without being overkill: the expected load is a handful of users at once.
 
-**Status:** steps 1 (foundation) and 2 (ingestion) done; step 3 next (see [Build order](#build-order)).
+**Status:** steps 1–3 (foundation, ingestion, rich ingestion) done; step 4 next (see [Build order](#build-order)).
 
 ---
 
@@ -130,10 +130,14 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 
 - One collection per embedding model and vector size, e.g. `chunks__gemini-embedding-2__768`. The active collection name comes from config. Re-embedding = build a new collection from `pages`, then switch config.
 - Embeddings: `gemini-embedding-2` at 768 dimensions, cosine distance. This model takes the task as a text prefix: chunks are embedded as `title: <file name> | text: <chunk>`, queries as `task: search result | query: <query>`.
-- Each point: dense vector + sparse (keyword) vector + payload `{user_id, course_id, session_id, document_id, kind, page_number, chunk_index, topics[], text}`.
+- Each point: dense vector + sparse (keyword) vector + payload `{user_id, course_id, session_id, document_id, filename, kind, page_number, chunk_index, topics[], text}`. Only lectures and notes are indexed (past exams are structure-only).
 - Payload indexes on `user_id`, `session_id`, `document_id`, `kind`, `topics` (missing ones are added on startup). `topics` holds normalized topic names, e.g. `["binary heaps"]`.
 - **Every search filters on `user_id` + `session_id`.** The filter is applied inside the search service, never chosen by the LLM.
-- **Hybrid search** (dense + sparse, fused) so exact terms like "Dijkstra" or "Theorem 3.2" are found as well as paraphrases.
+- **Hybrid search** (dense + sparse, fused) so exact terms like "Dijkstra" or "Theorem 3.2" are found as well as paraphrases (`services/search.py`):
+  - Keyword vectors are computed by us (`services/keywords.py`): lowercase, split into words (`3.2`, `c++`, `get_view` stay whole; hyphens split), BM25 term weights (k1 = 1.2, b = 0.75), word ids from a stable 32-bit hash. The collection's sparse vector uses `modifier=IDF`, so Qdrant adds the "rare words count more" part. No extra package or API call.
+  - A search embeds the query (`task: search result | query: …`), builds its keyword vector, runs both searches on the same filter (top 50 each), and merges them with RRF (`FusionQuery`), which uses ranks only, so the two score scales never need comparing.
+  - Optional filters: `kind` (lecture | notes) and `topic` (normalized name, matched against the `topics` list).
+- **Rebuild from Postgres:** `uv run python -m app.ingest.reindex` recreates the collection and re-indexes every ready lecture/notes file from `pages` + `document_topics` (no re-upload, OCR or topic calls; only embeddings are redone). Stop the worker while it runs. The API logs a warning at startup if the collection predates keyword search.
 - Point IDs are deterministic: `uuid5(document_id:page:chunk_index)`. Writes are **upserts**, so re-running ingestion never duplicates.
 
 ### Chunking
@@ -143,7 +147,7 @@ Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubri
 | PPTX | 1 slide = 1 chunk (slide text + speaker notes) |
 | Lecture/notes PDF | Per page; long pages split recursively (~800 chars, ~80 overlap) |
 | Past exam | **Not chunked or indexed.** Only its structure is kept: one Gemini call lists each question's type and printed points (`past_exam_questions`). ExamWriter uses the counts as a reference for a realistic exam shape, not the questions' content |
-| Scanned / image-only pages | Gemini vision OCR → text, then chunked as above (PDF only for now) |
+| Scanned / image-only pages, or text in an unreadable font | Gemini vision OCR → text, then chunked as above (PDF only for now) |
 
 Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks the extension **and** the file's first bytes (`%PDF-`, or the ZIP signature for PPTX): 415 for other types, 413 if too large, 422 if empty. Files are stored at `sessions/<session_id>/<document_id>.<ext>`, so a session's files are deleted by prefix. The cloud deploy should also cap request bodies in Caddy, since the app only sees the size after the upload has been received.
 
@@ -154,7 +158,7 @@ Accepted uploads: PDF and PPTX, max 50 MB each (`MAX_UPLOAD_MB`). The API checks
 Triggered by `POST /sessions/{id}/documents`: the API saves the file to object storage, creates a `documents` row (`queued`), puts an `ingest_document(document_id)` job on the queue (only the ID travels through Redis; the worker downloads the file itself), and returns 202 at once.
 
 `ingest_document` (queue `ingest`):
-1. Parse PDF/PPTX → pages. Detect scanned pages: a PDF page with **< 20 characters of text and at least one image** (`OCR_MAX_TEXT_CHARS` in `ingest/parsers.py`). Blank pages without images are skipped.
+1. Parse PDF/PPTX → pages. Detect scanned pages: a PDF page with **< 20 characters of text and at least one image** (`OCR_MAX_TEXT_CHARS` in `ingest/parsers.py`). Blank pages without images are skipped. Pages whose text comes out scrambled also go to OCR: some PDFs (often exported from PowerPoint) embed fonts without a glyph-to-letter table, so pypdf returns glyph numbers ("Split Brain" → `6SOLW\x03%UDLQ`); a page where more than 5% of characters are control characters (`looks_garbled`, `GARBLED_MIN_SHARE`) is treated that way, and its scrambled text is never stored.
 2. OCR those pages with Gemini (`OCR_MODEL`, default `gemini-3.5-flash-lite`): each page is cut out as a one-page PDF and sent with `ingest/prompts/ocr.md` ("transcribe exactly"). Saved with `source = 'ocr'`. Pages already read in an earlier run of the same document are reused, so a Retry doesn't pay for OCR twice. More than `MAX_OCR_PAGES` (100) scanned pages in one file → `failed` with a "split the file" message.
 3. Save `pages` rows.
 4. Extract topics: **one** LLM call per document (`TOPIC_MODEL`, prompt `ingest/prompts/topics.md`, structured JSON output) → topics with page ranges → merge into course topics.
@@ -270,6 +274,7 @@ Sessions
   DELETE /sessions/{id}                  cascades
   POST   /sessions/{id}/start            409 unless ≥1 document and every document is ready → status=active
   GET    /sessions/{id}/exam-profile     topics of this session's ready lectures/notes + past-exam structure
+  GET    /sessions/{id}/search           ?q=&kind=&topic=&limit= hybrid search over the session (try-it; same service as ExamWriter's tool)
 
 Documents (only while session status = setup, else 409)
   POST   /sessions/{id}/documents        multipart; 202 {document_id, status: queued}
@@ -333,7 +338,7 @@ Exams
 |---|---|---|
 | Unit (`tests/unit`) | Chunkers (slide, page), past-exam structure cleanup and exam-profile math, parsers and scan detection, topic name normalization and cleanup, Gemini retries, deterministic IDs, exam schema validation, MCQ grading, topic score math | Every push (GitHub Actions) |
 | API (`tests/api`) | Auth; **user A can't access user B's data**; session lock 409s; answer key hidden before grading; chat lock | Every push, against Postgres/Redis/Qdrant in Docker |
-| Test isolation | API tests use database `study_test`, Redis DB 15, bucket `<S3_BUCKET>-test` and Qdrant collection `<collection>__test` (set in `tests/conftest.py`), so they never touch dev data. They never call Gemini (fake embedder) or the real job queue | — |
+| Test isolation | API tests use database `study_test`, Redis DB 15, bucket `<S3_BUCKET>-test` and Qdrant collection `<collection>__test` (recreated at the start of each run; set in `tests/conftest.py`), so they never touch dev data. They never call Gemini (fakes for embeddings, OCR, topics, question counting) or the real job queue | — |
 | Agent evals (`tests/evals`) | Monopoly sample course: ExamWriter produces a valid exam whose sources point to real chunks; Grader scores known-good answers high and known-bad answers low; LLM-as-judge for quality | Manually (costs API calls) |
 
 ---
@@ -415,7 +420,7 @@ Each step ends with something runnable.
 
 - [x] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
 - [x] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
-- [ ] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam structure (question types and points) + exam profile, hybrid search.
+- [x] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam structure (question types and points) + exam profile, hybrid search.
 - [ ] **4. ExamWriter** + its tools + exam schema (try it via a script or `adk web`).
 - [ ] **5. Grader**, MCQ grading, attempts, topic scores.
 - [ ] **6. StudyCoach** + streaming chat endpoint + chat lock + rate limits.
@@ -430,4 +435,5 @@ Backend first (1–6) so the hard parts work before any UI exists.
 ## Open items
 
 - **Models:** embeddings use `gemini-embedding-2` (768 dims); OCR and other ingestion calls use `gemini-3.5-flash-lite`. Still to choose: coach / exam / grader (likely `gemini-3.8-flash`).
+- **Scrambled-font PDFs, known gaps:** (1) `looks_garbled` misses diagram pages where pypdf inserts real spaces between labels (few `\x03`); a second signal ("control characters present and < 20% of letters lowercase") would catch them. (2) Gemini OCR returned empty text for some diagram-heavy slides (e.g. timeline diagrams); not yet diagnosed (check the raw response's finish/block reason, maybe retry or tweak the "return nothing" rule in `ocr.md`).
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.

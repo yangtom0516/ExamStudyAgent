@@ -13,7 +13,7 @@ from qdrant_client import AsyncQdrantClient, models
 logger = logging.getLogger(__name__)
 
 DENSE = "dense"  # meaning-based vector (Gemini embedding)
-SPARSE = "sparse"  # keyword vector for hybrid search; filled in from step 3
+SPARSE = "sparse"  # keyword vector (services/keywords.py); Qdrant applies IDF to it
 INDEXED_FIELDS = ("user_id", "session_id", "document_id", "kind", "topics")
 UPSERT_BATCH = 128
 
@@ -48,19 +48,34 @@ class VectorStore:
                     vectors_config={
                         DENSE: models.VectorParams(size=self.dimensions, distance=models.Distance.COSINE)
                     },
-                    sparse_vectors_config={SPARSE: models.SparseVectorParams()},
+                    # IDF: Qdrant weighs each word by how rare it is across all chunks.
+                    sparse_vectors_config={SPARSE: models.SparseVectorParams(modifier=models.Modifier.IDF)},
                 )
                 logger.info("Created Qdrant collection %s", self.collection)
             except Exception:
                 # Another process (API or worker) may have created it at the same moment.
                 if not await self.client.collection_exists(self.collection):
                     raise
-        indexed = (await self.client.get_collection(self.collection)).payload_schema or {}
+        info = await self.client.get_collection(self.collection)
+        sparse = (info.config.params.sparse_vectors or {}).get(SPARSE)
+        if sparse is None or sparse.modifier != models.Modifier.IDF:
+            logger.warning(
+                "Qdrant collection %s was created before keyword search; run "
+                "`uv run python -m app.ingest.reindex` to rebuild it",
+                self.collection,
+            )
+        indexed = info.payload_schema or {}
         for field in INDEXED_FIELDS:
             if field not in indexed:
                 await self.client.create_payload_index(
                     self.collection, field, field_schema=models.PayloadSchemaType.KEYWORD
                 )
+
+    async def recreate_collection(self) -> None:
+        """Drop and recreate the collection, empty (used by reindex)."""
+        if await self.client.collection_exists(self.collection):
+            await self.client.delete_collection(self.collection)
+        await self.ensure_collection()
 
     async def upsert(self, points: list[models.PointStruct]) -> None:
         for start in range(0, len(points), UPSERT_BATCH):

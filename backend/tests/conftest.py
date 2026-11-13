@@ -126,6 +126,14 @@ def test_database() -> None:
     asyncio.run(_create_test_database())
     command.upgrade(Config(str(BACKEND_DIR / "alembic.ini")), "head")
 
+    # Start each run with a fresh test collection, so it's created with the current settings
+    # (e.g. keyword search's IDF). The app's startup recreates it.
+    settings = get_settings()
+    qdrant = QdrantClient(url=settings.qdrant_url)
+    if qdrant.collection_exists(settings.collection_name):
+        qdrant.delete_collection(settings.collection_name)
+    qdrant.close()
+
 
 @pytest.fixture
 def client(test_database):
@@ -133,6 +141,7 @@ def client(test_database):
     asyncio.run(_truncate_all_tables())
     with TestClient(app) as test_client:  # `with` runs the app's startup/shutdown code
         _empty_test_stores()
+        app.state.embedder = FakeEmbedder(get_settings().embed_dimensions)  # search never calls Gemini
         yield test_client
 
 

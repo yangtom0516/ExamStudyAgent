@@ -4,7 +4,7 @@ import pytest
 
 from app.config import get_settings
 from app.ingest.parsers import parse_pdf
-from tests.helpers import FakeOcr, create_course, create_session, make_pdf, upload_ok
+from tests.helpers import FakeOcr, create_course, create_session, make_pdf, unreadable_font, upload_ok
 
 
 @pytest.fixture
@@ -48,6 +48,19 @@ def test_scanned_page_is_read_and_indexed(client, session, run_ingest, chunk_pay
     stages = [(e["stage"], e.get("pages_done"), e.get("pages_total")) for e in published]
     assert stages[:3] == [("parsing", None, None), ("reading_scans", 0, 1), ("reading_scans", 1, 1)]
     assert stages[-1][0] == "ready"
+
+
+def test_text_in_an_unreadable_font_is_read_with_ocr(client, session, run_ingest, chunk_payloads, db_fetch_one):
+    slide = "Split Brain: the primary and backup disagree"
+    ocr = FakeOcr(slide)
+    document = upload_ok(client, session["id"], content=make_pdf([TYPED_PAGE, unreadable_font(slide)]))
+
+    run_ingest(document["id"], ocr=ocr)
+
+    assert len(ocr.pages) == 1  # only the scrambled page
+    assert page_row(db_fetch_one, document["id"], 1)["source"] == "text"
+    assert page_row(db_fetch_one, document["id"], 2) == {"text": slide, "source": "ocr"}
+    assert chunk_payloads(document["id"])[1]["text"] == slide
 
 
 def test_files_without_scans_skip_ocr(client, session, run_ingest, published):
@@ -97,5 +110,6 @@ def test_too_many_scanned_pages_fail_with_a_clear_message(client, session, run_i
 
     result = document_status(client, session["id"], document["id"])
     assert result["status"] == "failed"
-    assert f"{limit + 1} scanned pages" in result["error"] and f"at most {limit}" in result["error"]
+    assert f"{limit + 1} pages that must be read as images" in result["error"]
+    assert f"at most {limit}" in result["error"]
     assert ocr.pages == []  # refused before any call

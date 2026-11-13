@@ -12,8 +12,9 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api import auth, courses, documents, health, sessions
+from app.api import auth, courses, documents, health, search, sessions
 from app.config import get_settings
+from app.ingest.embedding import GeminiEmbedder
 from app.services.storage import Storage
 from app.services.vectors import VectorStore
 
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
     app.state.qdrant = AsyncQdrantClient(url=settings.qdrant_url)
     app.state.storage = Storage(settings)
     app.state.vectors = VectorStore(app.state.qdrant, settings.collection_name, settings.embed_dimensions)
+    app.state.embedder = GeminiEmbedder(settings)  # for search queries; connects on first use
 
     # Don't crash on startup if a store is down; /health will report it as failing.
     try:
@@ -55,3 +57,4 @@ app.include_router(auth.router)
 app.include_router(courses.router)
 app.include_router(sessions.router)
 app.include_router(documents.router)
+app.include_router(search.router)
