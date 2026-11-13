@@ -47,7 +47,7 @@ from app.db.base import Base  # noqa: E402
 from app.ingest import pipeline  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.storage import Storage  # noqa: E402
-from tests.helpers import FakeEmbedder  # noqa: E402
+from tests.helpers import FakeEmbedder, FakeOcr, FakeQuestionCounter, FakeTopics  # noqa: E402
 
 
 async def _create_test_database() -> None:
@@ -101,6 +101,14 @@ async def _execute(sql: str, params: dict) -> None:
     await engine.dispose()
 
 
+async def _fetch_all(sql: str, params: dict) -> list[dict]:
+    engine = create_async_engine(get_settings().database_url)
+    async with engine.connect() as conn:
+        rows = (await conn.execute(text(sql), params)).mappings().all()
+    await engine.dispose()
+    return [dict(row) for row in rows]
+
+
 async def _fetch_one(sql: str, params: dict) -> dict | None:
     engine = create_async_engine(get_settings().database_url)
     async with engine.connect() as conn:
@@ -118,6 +126,14 @@ def test_database() -> None:
     asyncio.run(_create_test_database())
     command.upgrade(Config(str(BACKEND_DIR / "alembic.ini")), "head")
 
+    # Start each run with a fresh test collection, so it's created with the current settings
+    # (e.g. keyword search's IDF). The app's startup recreates it.
+    settings = get_settings()
+    qdrant = QdrantClient(url=settings.qdrant_url)
+    if qdrant.collection_exists(settings.collection_name):
+        qdrant.delete_collection(settings.collection_name)
+    qdrant.close()
+
 
 @pytest.fixture
 def client(test_database):
@@ -125,6 +141,7 @@ def client(test_database):
     asyncio.run(_truncate_all_tables())
     with TestClient(app) as test_client:  # `with` runs the app's startup/shutdown code
         _empty_test_stores()
+        app.state.embedder = FakeEmbedder(get_settings().embed_dimensions)  # search never calls Gemini
         yield test_client
 
 
@@ -145,17 +162,23 @@ def published() -> list[dict]:
 @pytest.fixture
 def run_ingest(client, published):
     """Run the ingestion pipeline for a document right here (what the worker would do),
-    with a fake embedder instead of Gemini: run_ingest(document_id).
+    with fakes instead of Gemini: run_ingest(document_id, embedder=..., ocr=..., topics=..., questions=...).
     Progress events are recorded in `published` instead of going to Redis."""
 
     async def record(user_id, event) -> None:
         published.append(event)
 
-    def _run(document_id: str, embedder=None) -> None:
+    def _run(document_id: str, embedder=None, ocr=None, topics=None, questions=None) -> None:
         async def _go() -> None:
             settings = get_settings()
-            embedder_ = embedder or FakeEmbedder(settings.embed_dimensions)
-            async with pipeline.open_deps(settings, embedder_, publish=record) as deps:
+            async with pipeline.open_deps(
+                settings,
+                embedder or FakeEmbedder(settings.embed_dimensions),
+                publish=record,
+                ocr=ocr or FakeOcr(),
+                topics=topics or FakeTopics(),
+                questions=questions or FakeQuestionCounter(),
+            ) as deps:
                 await pipeline.ingest_document(uuid.UUID(document_id), deps)
 
         asyncio.run(_go())
@@ -201,6 +224,12 @@ def login_as(client):
 def db_fetch_one(test_database):
     """Run a SELECT against the test database and return the first row as a dict."""
     return lambda sql, **params: asyncio.run(_fetch_one(sql, params))
+
+
+@pytest.fixture
+def db_fetch_all(test_database):
+    """Run a SELECT against the test database and return all rows as dicts."""
+    return lambda sql, **params: asyncio.run(_fetch_all(sql, params))
 
 
 @pytest.fixture

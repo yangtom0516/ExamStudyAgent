@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DbSession, OwnedCourse, OwnedSession, StorageDep, VectorsDep, lock_session
 from app.db.models import Document, DocumentStatus, SessionStatus, StudySession
+from app.services.exam_profile import ExamProfile, build_exam_profile
 from app.services.storage import Storage, session_prefix
 from app.services.vectors import VectorStore
 
@@ -60,6 +61,13 @@ async def create_session(body: SessionCreate, course: OwnedCourse, db: DbSession
 @router.get("/sessions/{session_id}", response_model=SessionOut)
 async def get_session(study_session: OwnedSession):
     return study_session
+
+
+@router.get("/sessions/{session_id}/exam-profile", response_model=ExamProfile)
+async def get_exam_profile(study_session: OwnedSession, db: DbSession):
+    """Topics covered by this session's lectures/notes, and the structure of its past exams
+    (question counts per type, points). ExamWriter uses the same data to shape its exams."""
+    return await build_exam_profile(db, study_session.id)
 
 
 def _files(n: int) -> str:

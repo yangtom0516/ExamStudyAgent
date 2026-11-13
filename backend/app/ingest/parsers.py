@@ -2,15 +2,31 @@
 
 Files that can never be read (damaged, password-protected) raise UnreadableFileError, whose
 message is shown to the user. Those fail at once; retrying wouldn't help.
+
+Scanned PDF pages store a picture of the page, not text, so pypdf finds (almost) nothing on them.
+Such pages are flagged `needs_ocr` and read by Gemini later (see ocr.py). So are pages whose text
+comes out scrambled (see looks_garbled).
 """
 
 import io
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from pptx import Presentation
 from pptx.shapes.group import GroupShape
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
+
+# A page with less text than this *and* at least one image is treated as scanned. Not 0, because
+# scans often still carry a stamped page number or header.
+OCR_MAX_TEXT_CHARS = 20
+
+# Some PDFs (often exported from PowerPoint) embed fonts without a table that says which letter
+# each glyph is. pypdf then returns glyph numbers instead of letters, e.g. "Split Brain" comes out
+# as "6SOLW\x03%UDLQ": every space becomes the invisible control character \x03. Real text has
+# (almost) no control characters, so a page where more than this share of characters are control
+# characters is treated as unreadable and sent to OCR, which reads the page as it looks.
+GARBLED_MIN_SHARE = 0.05
 
 
 class UnreadableFileError(Exception):
@@ -21,6 +37,8 @@ class UnreadableFileError(Exception):
 class ParsedPage:
     number: int  # 1-based
     text: str  # "" when the page has no text layer (e.g. a scan)
+    needs_ocr: bool = False  # scanned (little text, but an image) or text that came out scrambled
+    source: str = "text"  # "text" (from the file's text layer) or "ocr" (read by Gemini)
 
 
 def clean_text(text: str) -> str:
@@ -43,23 +61,44 @@ def parse_document(data: bytes, extension: str) -> list[ParsedPage]:
 # --- PDF ---------------------------------------------------------------------
 
 
+def _open_pdf(data: bytes) -> PdfReader:
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        # Some PDFs are "encrypted" with an empty password just to restrict printing; those open fine.
+        try:
+            opened = reader.decrypt("")
+        except Exception:
+            opened = 0
+        if not opened:
+            raise UnreadableFileError("This PDF is password-protected. Remove the password and upload it again.")
+    return reader
+
+
+def looks_garbled(text: str) -> bool:
+    """Whether extracted text is scrambled glyph numbers rather than letters (see GARBLED_MIN_SHARE)."""
+    controls = sum(1 for c in text if c < " " and c != "\n")
+    return controls > 0 and controls / len(text) > GARBLED_MIN_SHARE
+
+
+def _has_images(page) -> bool:
+    """Whether the page draws any image. Counting doesn't decode the pixels, so it's cheap."""
+    try:
+        return len(page.images) > 0
+    except Exception:
+        return False
+
+
 def parse_pdf(data: bytes) -> list[ParsedPage]:
     try:
-        reader = PdfReader(io.BytesIO(data))
-        if reader.is_encrypted:
-            # Some PDFs are "encrypted" with an empty password just to restrict printing; those open fine.
-            try:
-                opened = reader.decrypt("")
-            except Exception:
-                opened = 0
-            if not opened:
-                raise UnreadableFileError(
-                    "This PDF is password-protected. Remove the password and upload it again."
-                )
-        pages = [
-            ParsedPage(number, clean_text(page.extract_text() or ""))
-            for number, page in enumerate(reader.pages, start=1)
-        ]
+        reader = _open_pdf(data)
+        pages = []
+        for number, page in enumerate(reader.pages, start=1):
+            text = clean_text(page.extract_text() or "")
+            if looks_garbled(text):
+                pages.append(ParsedPage(number, "", needs_ocr=True))  # never keep the scrambled text
+                continue
+            scanned = len(text) < OCR_MAX_TEXT_CHARS and _has_images(page)
+            pages.append(ParsedPage(number, text, needs_ocr=scanned))
     except UnreadableFileError:
         raise
     except Exception as exc:
@@ -67,6 +106,19 @@ def parse_pdf(data: bytes) -> list[ParsedPage]:
     if not pages:
         raise UnreadableFileError("This PDF is damaged or has no pages.")
     return pages
+
+
+def split_pdf_pages(data: bytes, numbers: Iterable[int]) -> dict[int, bytes]:
+    """Copy each requested page (1-based) into its own one-page PDF, e.g. to send it for OCR."""
+    reader = _open_pdf(data)
+    result = {}
+    for number in numbers:
+        writer = PdfWriter()
+        writer.add_page(reader.pages[number - 1])
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        result[number] = buffer.getvalue()
+    return result
 
 
 # --- PowerPoint ----------------------------------------------------------------

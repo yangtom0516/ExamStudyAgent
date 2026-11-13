@@ -3,8 +3,16 @@ import zipfile
 
 import pytest
 
-from app.ingest.parsers import UnreadableFileError, clean_text, parse_document, parse_pdf, parse_pptx
-from tests.helpers import make_encrypted_pdf, make_pdf, make_pptx, make_pptx_with_table
+from app.ingest.parsers import (
+    UnreadableFileError,
+    clean_text,
+    looks_garbled,
+    parse_document,
+    parse_pdf,
+    parse_pptx,
+    split_pdf_pages,
+)
+from tests.helpers import make_encrypted_pdf, make_pdf, make_pptx, make_pptx_with_table, unreadable_font
 
 
 def test_pdf_pages_are_read_in_order():
@@ -15,6 +23,46 @@ def test_pdf_pages_are_read_in_order():
     assert "Heaps and priority queues" in pages[0].text
     assert pages[1].text == ""  # no text layer, like a scanned page
     assert "Dijkstra shortest paths" in pages[2].text
+
+
+def test_only_scanned_looking_pages_are_flagged_for_ocr():
+    pages = parse_pdf(
+        make_pdf(
+            ["", "12", "", "Heaps are complete binary trees", "Short"],
+            image_pages=[1, 2, 4],  # page 3: blank divider (no image); page 5: little text, no image
+        )
+    )
+    assert [p.needs_ocr for p in pages] == [
+        True,  # image, no text: a scan
+        True,  # image + stamped page number: still a scan
+        False,  # blank page without an image: nothing to read
+        False,  # real text (plus an image): no OCR needed
+        False,  # little text but no image
+    ]
+    assert all(p.source == "text" for p in pages)
+
+
+def test_text_in_an_unreadable_font_goes_to_ocr_instead():
+    pages = parse_pdf(make_pdf([unreadable_font("Split Brain: the primary and backup disagree"), "Heaps"]))
+
+    assert pages[0].needs_ocr and pages[0].text == ""  # the scrambled text is never kept
+    assert not pages[1].needs_ocr and pages[1].text == "Heaps"
+
+
+def test_looks_garbled():
+    assert looks_garbled("6SOLW\x03%UDLQ\x03LV\x03EDG")  # "Split Brain is bad"
+    assert not looks_garbled("Split Brain\nis bad\n\nreally")  # newlines are normal
+    assert not looks_garbled("A long normal paragraph with one stray \x02 control character in it")
+    assert not looks_garbled("")
+
+
+def test_split_pdf_pages_makes_one_page_pdfs():
+    data = make_pdf(["first", "second", "third"])
+    parts = split_pdf_pages(data, [3, 1])
+
+    assert sorted(parts) == [1, 3]
+    assert [p.text for p in parse_pdf(parts[3])] == ["third"]
+    assert [p.text for p in parse_pdf(parts[1])] == ["first"]
 
 
 def test_password_protected_pdf_is_unreadable():

@@ -16,6 +16,7 @@ from app.db.models import Course, Document, SessionStatus, StudySession, User
 from app.db.session import get_db
 from app.services.security import read_access_token
 from app.services.storage import Storage
+from app.ingest.embedding import Embedder
 from app.services.vectors import VectorStore
 
 AUTH_COOKIE = "access_token"
@@ -112,3 +113,10 @@ def get_vectors(request: Request) -> VectorStore:
 
 
 VectorsDep = Annotated[VectorStore, Depends(get_vectors)]
+
+
+def get_embedder(request: Request) -> Embedder:
+    return request.app.state.embedder
+
+
+EmbedderDep = Annotated[Embedder, Depends(get_embedder)]

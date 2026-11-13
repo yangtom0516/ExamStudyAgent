@@ -1,4 +1,8 @@
-"""Ingest one document: download -> parse -> save pages -> chunk -> embed -> index in Qdrant -> ready.
+"""Ingest one document: download -> parse -> OCR scanned pages -> save pages -> chunk -> topics ->
+embed -> index in Qdrant -> ready.
+
+Past exams take a shorter path: download -> parse -> OCR -> save pages -> count questions -> ready.
+Only their structure (question types and points) is kept; they aren't chunked or indexed.
 
 Safe to run more than once for the same document (Celery may deliver a job twice, e.g. after
 a worker crash): pages are replaced, not added, and Qdrant point IDs are deterministic.
@@ -6,6 +10,7 @@ a worker crash): pages are replaced, not added, and Qdrant point IDs are determi
 Each stage is broadcast as a progress event (see services/progress.py) for the live UI.
 """
 
+import dataclasses
 import functools
 import logging
 import uuid
@@ -14,43 +19,68 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
-from app.db.models import Course, Document, DocumentStatus, Page, PageSource, StudySession
+from app.db.models import Course, Document, DocumentKind, DocumentStatus, Page, PageSource, StudySession
 from app.ingest.chunking import chunk_pages
 from app.ingest.embedding import Embedder, GeminiEmbedder
-from app.ingest.parsers import UnreadableFileError, parse_document
+from app.ingest.indexing import DocumentInfo, index_chunks
+from app.ingest.ocr import GeminiOcr, PageReader
+from app.ingest.parsers import ParsedPage, UnreadableFileError, parse_document, split_pdf_pages
+from app.ingest.past_exams import (
+    GeminiQuestionCounter,
+    QuestionCounter,
+    clean_questions,
+    load_questions,
+    save_questions,
+)
+from app.ingest.topics import (
+    GeminiTopics,
+    TopicExtractor,
+    clean_topics,
+    course_topic_names,
+    load_document_topics,
+    save_document_topics,
+    topics_by_page,
+)
 from app.services import progress
 from app.services.storage import Storage
-from app.services.vectors import DENSE, VectorStore, chunk_point_id
+from app.services.vectors import VectorStore
 
 logger = logging.getLogger(__name__)
 
 GENERIC_ERROR = "Something went wrong while reading this file. Press Retry to try again."
-NO_TEXT_ERROR = (
-    "No text found in this file. It may be scanned images only; reading scans is coming soon."
-)
+NO_TEXT_ERROR = "No readable text found in this file."
 
 
 @dataclass
 class IngestDeps:
-    """Connections the pipeline needs. Tests build it with a fake embedder."""
+    """Connections the pipeline needs. Tests build it with fakes for the Gemini parts."""
 
     sessionmaker: async_sessionmaker
     storage: Storage
     vectors: VectorStore
     embedder: Embedder
+    ocr: PageReader
+    topics: TopicExtractor
+    questions: QuestionCounter
     publish: progress.Publisher
+    max_ocr_pages: int
 
 
 @asynccontextmanager
 async def open_deps(
-    settings: Settings, embedder: Embedder | None = None, publish: progress.Publisher | None = None
+    settings: Settings,
+    embedder: Embedder | None = None,
+    publish: progress.Publisher | None = None,
+    ocr: PageReader | None = None,
+    topics: TopicExtractor | None = None,
+    questions: QuestionCounter | None = None,
 ) -> AsyncIterator[IngestDeps]:
     # NullPool: each Celery job runs in its own event loop, so don't keep connections between jobs.
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
@@ -64,7 +94,11 @@ async def open_deps(
             storage=Storage(settings),
             vectors=vectors,
             embedder=embedder or GeminiEmbedder(settings),
+            ocr=ocr or GeminiOcr(settings),
+            topics=topics or GeminiTopics(settings),
+            questions=questions or GeminiQuestionCounter(settings),
             publish=publish or functools.partial(progress.publish, redis),
+            max_ocr_pages=settings.max_ocr_pages,
         )
     finally:
         await redis.aclose()
@@ -72,21 +106,7 @@ async def open_deps(
         await engine.dispose()
 
 
-@dataclass(frozen=True)
-class _Job:
-    """What the pipeline needs to know about the document, copied out of the database row."""
-
-    document_id: uuid.UUID
-    session_id: uuid.UUID
-    course_id: uuid.UUID
-    user_id: uuid.UUID
-    filename: str
-    storage_key: str
-    kind: str
-
-    @property
-    def extension(self) -> str:
-        return PurePosixPath(self.storage_key).suffix
+_Job = DocumentInfo  # what the pipeline knows about the document it's processing
 
 
 async def ingest_document(document_id: uuid.UUID, deps: IngestDeps) -> None:
@@ -149,54 +169,126 @@ async def _process(job: _Job, deps: IngestDeps) -> None:
     # 1. Parse the file into pages.
     data = await deps.storage.download(job.storage_key)
     pages = parse_document(data, job.extension)
+    pages = await _read_scans(job, deps, data, pages)
 
     # 2. Save the page texts (replacing any from an earlier run).
     async with deps.sessionmaker() as db:
         await db.execute(delete(Page).where(Page.document_id == job.document_id))
         db.add_all(
-            Page(document_id=job.document_id, page_number=p.number, text=p.text, source=PageSource.TEXT)
+            Page(document_id=job.document_id, page_number=p.number, text=p.text, source=p.source)
             for p in pages
         )
         await db.execute(update(Document).where(Document.id == job.document_id).values(page_count=len(pages)))
         await db.commit()
 
-    # 3. Chunk and embed.
+    title = PurePosixPath(job.filename).stem
+    if job.kind == DocumentKind.PAST_EXAM:
+        await _count_questions(job, deps, pages, title)
+        return
+
+    # 3. Chunk (checked before the topic call, so a file with no text costs nothing more).
     chunks = chunk_pages(pages, slides=job.extension == ".pptx")
     if not chunks:
         raise UnreadableFileError(NO_TEXT_ERROR)
+
+    # 4. Topics, so each chunk can be tagged with the topics of its page.
+    page_topics = await _find_topics(job, deps, pages, title)
+
+    # 5. Embed and index in Qdrant (meaning + keyword vectors).
     await _report(job, deps, progress.INDEXING, page_count=len(pages))
-    title = PurePosixPath(job.filename).stem
-    vectors = await deps.embedder.embed_documents([c.text for c in chunks], title=title)
+    await index_chunks(job, chunks, page_topics, deps.embedder, deps.vectors)
 
-    # 4. Index in Qdrant. Old points go first, in case an earlier run produced more chunks.
-    payload = {
-        "user_id": str(job.user_id),
-        "course_id": str(job.course_id),
-        "session_id": str(job.session_id),
-        "document_id": str(job.document_id),
-        "kind": job.kind,
-        "topics": [],  # filled by topic extraction in step 3
-    }
-    points = [
-        models.PointStruct(
-            id=str(chunk_point_id(job.document_id, chunk.page_number, chunk.chunk_index)),
-            vector={DENSE: vector},
-            payload={
-                **payload,
-                "page_number": chunk.page_number,
-                "chunk_index": chunk.chunk_index,
-                "text": chunk.text,
-            },
-        )
-        for chunk, vector in zip(chunks, vectors, strict=True)
-    ]
-    await deps.vectors.delete_document(job.document_id)
-    await deps.vectors.upsert(points)
-
-    # 5. Done.
+    # 6. Done.
     if await _finish(job, deps, DocumentStatus.READY, None):
         await _report(job, deps, progress.READY, page_count=len(pages), chunk_count=len(chunks))
         logger.info("Document %s ready: %d pages, %d chunks", job.document_id, len(pages), len(chunks))
+
+
+async def _read_scans(job: _Job, deps: IngestDeps, data: bytes, pages: list[ParsedPage]) -> list[ParsedPage]:
+    """OCR the pages flagged `needs_ocr` (scans, or text in an unreadable font), one Gemini call per page.
+
+    Pages read in an earlier run of this document (e.g. before a later step failed and the user
+    pressed Retry) are reused from the `pages` table instead of being paid for again.
+    """
+    scanned = [p for p in pages if p.needs_ocr]
+    if not scanned:
+        return pages
+    if len(scanned) > deps.max_ocr_pages:
+        raise UnreadableFileError(
+            f"This file has {len(scanned)} pages that must be read as images (scanned, or text in an "
+            f"unreadable font); at most {deps.max_ocr_pages} can be read per file. Split it into "
+            "smaller files and upload them separately."
+        )
+
+    async with deps.sessionmaker() as db:
+        rows = await db.execute(
+            select(Page.page_number, Page.text).where(
+                Page.document_id == job.document_id, Page.source == PageSource.OCR
+            )
+        )
+        read_before: dict[int, str] = dict(rows.all())
+    to_read = [p.number for p in scanned if p.number not in read_before]
+    page_pdfs = split_pdf_pages(data, to_read)
+
+    texts: dict[int, str] = {}
+    await _report(job, deps, progress.READING_SCANS, pages_done=0, pages_total=len(scanned))
+    for done, page in enumerate(scanned, start=1):
+        if page.number in read_before:
+            texts[page.number] = read_before[page.number]
+        else:
+            texts[page.number] = await deps.ocr.read_page(page_pdfs[page.number])
+        await _report(job, deps, progress.READING_SCANS, pages_done=done, pages_total=len(scanned))
+    logger.info(
+        "Document %s: OCR'd %d pages (%d reused from an earlier run)",
+        job.document_id,
+        len(scanned),
+        len(scanned) - len(to_read),
+    )
+
+    return [
+        dataclasses.replace(p, text=texts[p.number], source=PageSource.OCR, needs_ocr=False)
+        if p.number in texts
+        else p
+        for p in pages
+    ]
+
+
+async def _count_questions(job: _Job, deps: IngestDeps, pages: list[ParsedPage], title: str) -> None:
+    """Past exams: store the question types and points (one Gemini call), then mark ready.
+    Questions saved by an earlier run of this document are reused."""
+    if not any(p.text for p in pages):
+        raise UnreadableFileError(NO_TEXT_ERROR)
+
+    async with deps.sessionmaker() as db:
+        questions = await load_questions(db, job.document_id)
+    if not questions:
+        await _report(job, deps, progress.COUNTING_QUESTIONS)
+        questions = clean_questions(await deps.questions.count(pages, title))
+        async with deps.sessionmaker() as db:
+            await save_questions(db, job.document_id, questions)
+            await db.commit()
+
+    if await _finish(job, deps, DocumentStatus.READY, None):
+        await _report(job, deps, progress.READY, page_count=len(pages), question_count=len(questions))
+        logger.info("Past exam %s ready: %d pages, %d questions", job.document_id, len(pages), len(questions))
+
+
+async def _find_topics(job: _Job, deps: IngestDeps, pages: list[ParsedPage], title: str) -> dict[int, list[str]]:
+    """Find the document's topics (one Gemini call), merge them into the course, and return
+    page number -> topic names. Topics saved by an earlier run of this document are reused."""
+    async with deps.sessionmaker() as db:
+        ranges = await load_document_topics(db, job.document_id)
+        existing = await course_topic_names(db, job.course_id) if not ranges else []
+
+    if not ranges:
+        await _report(job, deps, progress.FINDING_TOPICS)
+        raw = await deps.topics.extract(pages, existing, title)  # slow: no database session held
+        ranges = clean_topics(raw, page_count=len(pages))
+        async with deps.sessionmaker() as db:
+            await save_document_topics(db, job.course_id, job.document_id, ranges)
+            await db.commit()
+        logger.info("Document %s: %d topic ranges", job.document_id, len(ranges))
+    return topics_by_page(ranges)
 
 
 async def _finish(job: _Job, deps: IngestDeps, status: DocumentStatus, error: str | None) -> bool:
