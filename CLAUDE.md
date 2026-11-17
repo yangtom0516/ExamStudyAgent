@@ -122,7 +122,11 @@ attempt_grades attempt_id, question_id, points, feedback, citations (JSONB)   --
 }]
 ```
 
-Validated by a Pydantic model in `save_exam`. **The answer key (`answer`, `rubric`) is never sent to the browser before the attempt is graded.**
+Validated in `save_exam` (`services/exams.py`), in two layers; every problem is returned as a sentence naming the question (`"q3: page 57 doesn't exist in Lecture 5.pdf (41 pages)"`), all at once, and nothing is saved if anything is wrong:
+1. **Shape** (Pydantic `ExamDraft`): 1–30 questions; points 1–100; multiple choice has 2–6 distinct choices and `answer` is one of them (matched ignoring case, stored with the choice's spelling; any rubric dropped); written questions have no choices and ≥1 rubric line; every question has 1–10 sources.
+2. **Against the database:** the session is `active` and belongs to the user; every source is a page that exists in a ready lecture/notes file **of this session**; every `topic` matches a course topic by normalized name and is stored under the course's spelling (so step 5's scores add up per topic).
+
+Question ids (`q1`, `q2`, …) are assigned by the server on save. `exams.request` stores the student's request word for word (from the server, not the agent). **The answer key (`answer`, `rubric`) and `sources` (a page reference is a hint) are never sent to the browser before the attempt is graded**: `GET /exams/{id}` returns `PublicQuestion` (id, type, topic, points, prompt, choices).
 
 ---
 
@@ -288,8 +292,8 @@ Chat (only while session status = active)
   GET    /sessions/{id}/chat/history
 
 Exams
-  GET    /sessions/{id}/exams
-  GET    /exams/{id}                     questions WITHOUT answer key
+  GET    /sessions/{id}/exams            newest first: title, question_count, total_points
+  GET    /exams/{id}                     questions WITHOUT answer key or sources
   POST   /exams/{id}/attempts            {answers} → {attempt_id}
   GET    /attempts/{id}                  score, per-question feedback, answer key (only once graded)
 ```

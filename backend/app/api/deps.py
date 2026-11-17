@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.db.models import Course, Document, SessionStatus, StudySession, User
+from app.db.models import Course, Document, Exam, SessionStatus, StudySession, User
 from app.db.session import get_db
 from app.services.security import read_access_token
 from app.services.storage import Storage
@@ -70,9 +70,23 @@ async def get_owned_document(document_id: uuid.UUID, user: CurrentUser, db: DbSe
     return document
 
 
+async def get_owned_exam(exam_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Exam:
+    """The exam from the URL's {exam_id}, if its session's course belongs to the logged-in user."""
+    exam = await db.scalar(
+        select(Exam)
+        .join(StudySession, Exam.session_id == StudySession.id)
+        .join(Course, StudySession.course_id == Course.id)
+        .where(Exam.id == exam_id, Course.user_id == user.id)
+    )
+    if exam is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Exam not found")
+    return exam
+
+
 OwnedCourse = Annotated[Course, Depends(get_owned_course)]
 OwnedSession = Annotated[StudySession, Depends(get_owned_session)]
 OwnedDocument = Annotated[Document, Depends(get_owned_document)]
+OwnedExam = Annotated[Exam, Depends(get_owned_exam)]
 
 
 def require_setup(study_session: StudySession) -> None:

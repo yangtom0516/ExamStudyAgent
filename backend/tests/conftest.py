@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import get_settings
 
@@ -46,6 +46,7 @@ from qdrant_client import QdrantClient, models  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.ingest import pipeline  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services import exams  # noqa: E402
 from app.services.storage import Storage  # noqa: E402
 from tests.helpers import FakeEmbedder, FakeOcr, FakeQuestionCounter, FakeTopics  # noqa: E402
 
@@ -242,3 +243,26 @@ def db_execute(test_database):
 def stored_file_exists(client):
     """Check whether a key exists in the test bucket (depends on `client`, whose startup creates the bucket)."""
     return lambda key: asyncio.run(_test_storage().exists(key))
+
+
+@pytest.fixture
+def save_exam(client):
+    """Save an exam as the logged-in user, the way ExamWriter's save_exam tool does:
+    save_exam(session_id, exam_json, request=...) -> SaveResult (exam_id, or errors)."""
+
+    def _save(session_id: str, exam: dict, request: str = "Write a practice exam") -> exams.SaveResult:
+        user_id = uuid.UUID(client.get("/auth/me").json()["id"])
+
+        async def _go() -> exams.SaveResult:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+                    return await exams.save_exam(
+                        db, user_id=user_id, session_id=uuid.UUID(session_id), exam=exam, request=request
+                    )
+            finally:
+                await engine.dispose()
+
+        return asyncio.run(_go())
+
+    return _save

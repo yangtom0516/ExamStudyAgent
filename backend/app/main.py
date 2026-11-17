@@ -12,7 +12,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api import auth, courses, documents, health, search, sessions
+from app.api import auth, courses, documents, exams, health, search, sessions
 from app.config import get_settings
 from app.ingest.embedding import GeminiEmbedder
 from app.services.storage import Storage
@@ -58,3 +58,4 @@ app.include_router(courses.router)
 app.include_router(sessions.router)
 app.include_router(documents.router)
 app.include_router(search.router)
+app.include_router(exams.router)

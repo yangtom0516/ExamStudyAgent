@@ -15,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -182,3 +183,23 @@ class PastExamQuestion(Base):
     number: Mapped[str] = mapped_column(String(20))  # as printed: "3", "Q2", "4b"
     type: Mapped[str] = mapped_column(String(20))
     points: Mapped[int | None] = mapped_column(Integer)  # only when printed
+
+
+class Exam(Base):
+    """A mock exam written by ExamWriter inside a study session.
+
+    `questions` holds the whole exam as JSON, answer key included (format: services/exams.py,
+    `Question`). It's always read and written as one piece, so one JSON column is simpler than a
+    questions table. The API strips `answer` and `rubric` before an attempt is graded.
+    """
+
+    __tablename__ = "exams"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("study_sessions.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(200))
+    request: Mapped[str] = mapped_column(Text)  # what the student asked for, word for word
+    questions: Mapped[list[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
