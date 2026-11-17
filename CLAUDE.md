@@ -221,11 +221,12 @@ Understands the request, asks follow-up questions when needed (topics, number an
 
 | Tool | Purpose |
 |---|---|
-| `search_course_materials(query, kind?)` | Hybrid search in this session's chunks (lectures and notes); returns text + citations |
-| `get_exam_profile()` | This session's topics with coverage, and its past exams' structure (questions per type, average per exam, points), as a reference for a realistic exam shape (`services/exam_profile.py`) |
-| `list_course_topics()` | For even topic coverage |
-| `get_weak_topics()` | Default focus when the request is vague |
-| `save_exam(exam)` | Validates and saves atomically; **returns validation errors so the agent can fix and retry** |
+| `get_exam_profile()` | This session's topics with coverage (the only valid question topics), and its past exams' structure (questions per type, average per exam, points), as a reference for a realistic exam shape (`services/exam_profile.py`) |
+| `search_course_materials(query, kind?, topic?)` | Hybrid search in this session's chunks (lectures and notes); **up to 5 passages** (`document_id`, `filename`, `page`, `topics`, `text` clipped to ~1,200 chars). Few passages on purpose: each one stays in the conversation and is re-sent on every later call |
+| `save_exam(title, questions)` | Runs the checks in `services/exams.py` and saves atomically; **returns the errors so the agent can fix and retry**. The request saved with the exam comes from state; on success the new id goes into state (`last_exam_id`) for the chat stream |
+| `get_weak_topics()` | Default focus when the request is vague (added in step 5, once scores exist) |
+
+No `list_course_topics()` for ExamWriter: course topics from other sessions have no material here to cite (StudyCoach gets it). Tools live in `agents/tools/` (`make_exam_writer_tools(AgentServices)`); each reads the identity from `tool_context.state` (`agents/tools/context.py`, `initial_state`) and returns `{"ok": false, "error": …}` if it's missing.
 
 If materials are thin for a requested topic, it writes fewer questions and says so.
 

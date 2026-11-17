@@ -20,6 +20,7 @@ dependencies = [
     "google-genai>=1.30",  # Gemini API: embeddings now; OCR, topics and agents later
     "pypdf[crypto]>=5.0",  # PDF text; [crypto] reads AES-encrypted PDFs that have no password
     "python-pptx>=1.0",  # PowerPoint slide text and speaker notes
+    "google-adk>=2.14.1",
 ]
 
 [dependency-groups]
