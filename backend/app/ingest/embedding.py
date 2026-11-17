@@ -10,7 +10,12 @@ from typing import Protocol
 from google.genai import types
 
 from app.config import Settings
-from app.services.gemini import make_client, with_retries
+from app.services.gemini import (
+    INTERACTIVE_MAX_SERVER_DELAY_SECONDS,
+    INTERACTIVE_RETRY_DELAYS_SECONDS,
+    make_client,
+    with_retries,
+)
 
 BATCH_SIZE = 50  # texts per API request
 
@@ -65,8 +70,12 @@ class GeminiEmbedder:
         if self._client is None:
             self._client = make_client(self._settings)
         contents = [types.Content(parts=[types.Part.from_text(text=query_prompt(query))])]
+        # Queries are only embedded while someone waits (the search endpoint, an agent's search):
+        # short retries, so a chat turn fails within seconds instead of hanging for minutes.
         result = await with_retries(
             lambda: self._client.aio.models.embed_content(model=self._model, contents=contents, config=self._config),
             what="Embedding a search query",
+            delays=INTERACTIVE_RETRY_DELAYS_SECONDS,
+            max_server_delay=INTERACTIVE_MAX_SERVER_DELAY_SECONDS,
         )
         return list(result.embeddings[0].values)

@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 RETRY_DELAYS_SECONDS = (2, 4, 8, 16, 32)  # exponential backoff, at most 5 retries
 MAX_SERVER_DELAY_SECONDS = 90  # cap on how long we'll wait when Google asks us to
 
+# While a student waits (search during a chat turn), give up within about 30 s instead.
+INTERACTIVE_RETRY_DELAYS_SECONDS = (1, 2, 4)
+INTERACTIVE_MAX_SERVER_DELAY_SECONDS = 10
+
 
 def make_client(settings: Settings) -> genai.Client:
     api_key = settings.google_api_key.get_secret_value()
@@ -48,19 +52,27 @@ def server_retry_delay(exc: BaseException) -> float | None:
     return None
 
 
-async def with_retries[T](call: Callable[[], Awaitable[T]], what: str) -> T:
+async def with_retries[T](
+    call: Callable[[], Awaitable[T]],
+    what: str,
+    *,
+    delays: tuple[float, ...] = RETRY_DELAYS_SECONDS,
+    max_server_delay: float = MAX_SERVER_DELAY_SECONDS,
+) -> T:
     """Run `call`, retrying transient failures with backoff. Other errors are raised at once.
 
     When a rate-limit response says how long to wait (e.g. until the per-minute quota resets),
-    wait that long instead, so retries don't all land inside the same minute and fail again.
+    wait that long instead (up to `max_server_delay`), so retries don't all land inside the
+    same minute and fail again. The defaults suit background work; pass the INTERACTIVE_*
+    values when someone is waiting for the answer.
     """
-    for attempt, backoff in enumerate((*RETRY_DELAYS_SECONDS, None), start=1):
+    for attempt, backoff in enumerate((*delays, None), start=1):
         try:
             return await call()
         except Exception as exc:
             if backoff is None or not is_transient(exc):
                 raise
-            delay = max(backoff, min(server_retry_delay(exc) or 0, MAX_SERVER_DELAY_SECONDS))
+            delay = max(backoff, min(server_retry_delay(exc) or 0, max_server_delay))
             logger.warning("%s failed (attempt %d: %r); retrying in %.0fs", what, attempt, exc, delay)
             await asyncio.sleep(delay)
     raise AssertionError("unreachable")

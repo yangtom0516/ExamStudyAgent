@@ -2,9 +2,17 @@
 
 import io
 from collections.abc import Iterable
+from contextlib import asynccontextmanager
 
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_response import LlmResponse
+from google.genai import types
 from pptx import Presentation
 from pptx.util import Inches
+from pydantic import Field
+from qdrant_client import AsyncQdrantClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 # Minimal files that pass the upload's "first bytes" check, for tests that never parse them.
 PDF_BYTES = b"%PDF-1.4\n% tiny test file\n"
@@ -190,3 +198,68 @@ class FakeQuestionCounter:
         if self.error:
             raise self.error
         return [QuestionItem(number=n, type=t, points=p) for n, t, p in self.questions]
+
+
+# --- agents ------------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def open_agent_services(embedder=None):
+    """AgentServices on the test database and Qdrant collection, closed afterwards.
+    Open it inside the asyncio.run that uses it: connections belong to one event loop."""
+    from app.agents.tools import AgentServices
+    from app.config import get_settings
+    from app.services.vectors import VectorStore
+
+    settings = get_settings()
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    qdrant = AsyncQdrantClient(url=settings.qdrant_url)
+    try:
+        yield AgentServices(
+            sessionmaker=async_sessionmaker(engine, expire_on_commit=False),
+            vectors=VectorStore(qdrant, settings.collection_name, settings.embed_dimensions),
+            embedder=embedder or FakeEmbedder(settings.embed_dimensions),
+        )
+    finally:
+        await qdrant.close()
+        await engine.dispose()
+
+
+def call(name: str, **args) -> types.Part:
+    """A scripted model reply part: "call tool `name` with `args`"."""
+    return types.Part(function_call=types.FunctionCall(name=name, args=args))
+
+
+def say(text: str) -> types.Part:
+    """A scripted model reply part: plain text (a final answer)."""
+    return types.Part(text=text)
+
+
+class ScriptedModel(BaseLlm):
+    """Stands in for Gemini in agent tests: each model call gets the next reply from `script`.
+
+    A script item is a list of parts (see call/say), or an Exception to raise (the model API
+    failing). The last item repeats once the script runs out. Every request the agent sent is kept
+    in `requests`, so tests can check what the model was shown (e.g. a tool's error).
+    """
+
+    model: str = "scripted"
+    script: list = Field(default_factory=list)
+    requests: list = Field(default_factory=list)
+
+    async def generate_content_async(self, llm_request, stream: bool = False):
+        self.requests.append(llm_request)
+        item = self.script[min(len(self.requests), len(self.script)) - 1]
+        if isinstance(item, Exception):
+            raise item
+        yield LlmResponse(
+            content=types.Content(role="model", parts=item),
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=1000, candidates_token_count=100
+            ),
+        )
+
+    def tool_results_seen(self, call_number: int) -> list[dict]:
+        """The tool results the agent sent to the model on its `call_number`-th call (1-based)."""
+        last_turn = self.requests[call_number - 1].contents[-1]
+        return [part.function_response.response for part in last_turn.parts if part.function_response]

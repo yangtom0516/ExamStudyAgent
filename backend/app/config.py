@@ -38,10 +38,13 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24 * 7  # login lasts 7 days
     cookie_secure: bool = False  # True in the cloud deploy: send the login cookie over HTTPS only
 
-    # Gemini. The API key is needed by the ingestion worker (embeddings) and, later, the agents.
+    # Gemini. The API key is needed by the ingestion worker (embeddings) and the agents.
     google_api_key: SecretStr = SecretStr("")
+    # Agent models: a Gemini model id, or "<provider>/<model>" for other providers via LiteLLM
+    # (see agents/models.py).
     coach_model: str = ""
-    exam_model: str = ""
+    exam_model: str = "gemini-3.8-flash"
+    exam_max_llm_calls: int = 25  # model calls per ExamWriter run; also caps one run's cost (~$1)
     grader_model: str = ""
     ocr_model: str = "gemini-3.5-flash-lite"  # cheap, fast, reads PDFs and images
     max_ocr_pages: int = 100  # per file; caps the cost of one huge scanned upload

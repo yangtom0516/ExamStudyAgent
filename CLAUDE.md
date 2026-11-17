@@ -226,6 +226,8 @@ Understands the request, asks follow-up questions when needed (topics, number an
 | `save_exam(title, questions)` | Runs the checks in `services/exams.py` and saves atomically; **returns the errors so the agent can fix and retry**. The request saved with the exam comes from state; on success the new id goes into state (`last_exam_id`) for the chat stream |
 | `get_weak_topics()` | Default focus when the request is vague (added in step 5, once scores exist) |
 
+The agent (`agents/exam_writer.py`, `build_exam_writer`) runs on `EXAM_MODEL` (default `gemini-3.8-flash`) with instructions from `agents/prompts/exam_writer.md`: goals and rules, not a fixed sequence (plan from the profile and copy the past exams' shape unless asked otherwise; search 1–2 times per topic; base every question on retrieved passages and cite them exactly; fix what `save_exam` reports; fewer questions when material is thin; a 2–4 sentence summary as the reply, **never the questions, answers or rubric**). The instruction is passed as a function so ADK doesn't treat `{…}` in the prompt as state variables. `run_exam_writer(services, settings, identity=, request=)` runs it once on an in-memory ADK session (identity in state) with `RunConfig(max_llm_calls=EXAM_MAX_LLM_CALLS)` (25; **ADK's own default is 500**), and returns the reply, `exam_id` (from state, so it's reported even if the run fails after saving), every tool call and result, model calls and tokens. It never raises: call limit → "I couldn't finish that; try a smaller request.", other failures → a friendly message.
+
 No `list_course_topics()` for ExamWriter: course topics from other sessions have no material here to cite (StudyCoach gets it). Tools live in `agents/tools/` (`make_exam_writer_tools(AgentServices)`); each reads the identity from `tool_context.state` (`agents/tools/context.py`, `initial_state`) and returns `{"ok": false, "error": …}` if it's missing.
 
 If materials are thin for a requested topic, it writes fewer questions and says so.
@@ -247,7 +249,10 @@ If materials are thin for a requested topic, it writes fewer questions and says 
 ### Agent rules
 
 - **Identity comes from session state, never from tool arguments.** `user_id`, `course_id` and `session_id` are put in ADK session state by the server; tools read them from `tool_context.state`. The LLM can't choose whose data to read.
-- Cap LLM calls per turn with ADK `RunConfig(max_llm_calls=…)` (~25). On hitting the cap: "I couldn't finish that; try a smaller request."
+- Cap LLM calls per turn with ADK `RunConfig(max_llm_calls=…)` (~25; ADK's default is 500, so always set it). On hitting the cap: "I couldn't finish that; try a smaller request."
+- **Tool failures:** a tool returns `{"ok": false, …}` for problems the model can fix (bad arguments, checker errors, nothing found). ADK itself answers made-up tool names and missing arguments. An exception inside a tool (database, Qdrant or Gemini down) would abort the run, so every agent has an `on_tool_error_callback` that logs it and gives the model "failed for a technical reason (not your mistake); try once more, then stop"; the prompt says to stop after two technical errors.
+- **Agent models:** `make_model(name, settings)` (`agents/models.py`): Gemini ids get our API key via `client_kwargs` (ADK otherwise only reads the OS environment, which `.env` never reaches) and short retries (3 attempts); `"<provider>/<model>"` names go through LiteLLM (not installed until needed). Search queries are embedded with short retries (1, 2, 4 s; Google's wait capped at 10 s) so a chat turn never hangs for minutes; ingestion keeps its long retries.
+- **Agent tests** use `ScriptedModel` (`tests/helpers.py`), a fake `BaseLlm` that replays scripted replies (tool calls, text, or an exception), so ADK's loop, the tools and the checks run for real without API calls.
 - Agents touch the outside world **only through their tools**. `agents/` imports services; services never import agents. This keeps agents testable and splittable later.
 - Model names come from config (`COACH_MODEL`, `EXAM_MODEL`, `GRADER_MODEL`). Gemini by default; ADK's `LiteLlm` wrapper allows other providers without code changes.
 - Prompts live in `backend/app/agents/prompts/` as separate files, not inline strings.
@@ -329,7 +334,8 @@ Exams
 | Gemini 429 / 5xx / timeout during ingestion | Retried per API call with backoff (or Google's `retryDelay`), then `failed` + Retry button |
 | Corrupt or password-protected file | Fail immediately, clear message |
 | Worker crash mid-job | Redelivered (`acks_late`); idempotent upserts prevent duplicates |
-| Error during an agent turn | SSE `error` event, chat unlocks, nothing half-saved |
+| Error during an agent turn | SSE `error` event, chat unlocks, nothing half-saved (an exam saved before the error is still reported) |
+| A tool crashes (database, Qdrant, Gemini embedding down) | `on_tool_error_callback` turns it into a tool error; the agent retries once, then stops and says so |
 | `max_llm_calls` reached | Polite "try a smaller request" message |
 | Grader fails midway | Grades so far are kept; attempt `grading_failed`; Regrade re-runs (upserts) |
 | Not enough material | ExamWriter writes fewer questions and says why |
@@ -353,7 +359,8 @@ Exams
 ```
 GOOGLE_API_KEY=
 COACH_MODEL=            # Gemini model names from Google AI Studio
-EXAM_MODEL=
+EXAM_MODEL=gemini-3.8-flash
+EXAM_MAX_LLM_CALLS=25
 GRADER_MODEL=
 OCR_MODEL=gemini-3.5-flash-lite
 MAX_OCR_PAGES=100
@@ -439,6 +446,6 @@ Backend first (1–6) so the hard parts work before any UI exists.
 
 ## Open items
 
-- **Models:** embeddings use `gemini-embedding-2` (768 dims); OCR and other ingestion calls use `gemini-3.5-flash-lite`. Still to choose: coach / exam / grader (likely `gemini-3.8-flash`).
+- **Models:** embeddings use `gemini-embedding-2` (768 dims); OCR and other ingestion calls use `gemini-3.5-flash-lite`; ExamWriter uses `gemini-3.8-flash`. Still to choose: coach / grader (likely `gemini-3.8-flash`).
 - **Scrambled-font PDFs, known gaps:** (1) `looks_garbled` misses diagram pages where pypdf inserts real spaces between labels (few `\x03`); a second signal ("control characters present and < 20% of letters lowercase") would catch them. (2) Gemini OCR returned empty text for some diagram-heavy slides (e.g. timeline diagrams); not yet diagnosed (check the raw response's finish/block reason, maybe retry or tweak the "return nothing" rule in `ocr.md`).
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.

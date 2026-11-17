@@ -81,3 +81,18 @@ def test_permanent_errors_are_not_retried(no_waiting):
     with pytest.raises(genai_errors.APIError):
         asyncio.run(gemini.with_retries(call, what="test"))
     assert no_waiting == []
+
+
+def test_interactive_retries_give_up_within_seconds(no_waiting):
+    """While a student waits (search during a chat turn): 3 short retries, Google's wait capped at 10 s."""
+    call = flaky([rate_limited("57s"), api_error(503), api_error(503), api_error(503)])
+    with pytest.raises(genai_errors.APIError):
+        asyncio.run(
+            gemini.with_retries(
+                call,
+                what="test",
+                delays=gemini.INTERACTIVE_RETRY_DELAYS_SECONDS,
+                max_server_delay=gemini.INTERACTIVE_MAX_SERVER_DELAY_SECONDS,
+            )
+        )
+    assert no_waiting == [10, 2, 4]

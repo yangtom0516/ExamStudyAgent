@@ -7,22 +7,17 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from qdrant_client import AsyncQdrantClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
-from app.agents.tools import AgentServices, make_exam_writer_tools
+from app.agents.tools import make_exam_writer_tools
 from app.agents.tools.context import LAST_EXAM_ID, initial_state
 from app.agents.tools.materials import MAX_RESULTS, clip
-from app.config import get_settings
-from app.services.vectors import VectorStore
 from tests.helpers import (
-    FakeEmbedder,
     FakeQuestionCounter,
     FakeTopics,
     create_course,
     create_session,
     make_pdf,
+    open_agent_services,
     upload_ok,
 )
 
@@ -32,24 +27,12 @@ LECTURE_PAGES = ["Split brain happens when two primaries", "The view service dec
 @pytest.fixture
 def call_tool(client):
     """call_tool(name, state, **arguments) -> the tool's result, like ADK running it."""
-    settings = get_settings()
 
     def _call(name: str, state: dict, **arguments) -> dict:
         async def _go() -> dict:
-            # Fresh connections per call: each asyncio.run is a new event loop.
-            engine = create_async_engine(settings.database_url, poolclass=NullPool)
-            qdrant = AsyncQdrantClient(url=settings.qdrant_url)
-            try:
-                services = AgentServices(
-                    sessionmaker=async_sessionmaker(engine, expire_on_commit=False),
-                    vectors=VectorStore(qdrant, settings.collection_name, settings.embed_dimensions),
-                    embedder=FakeEmbedder(settings.embed_dimensions),
-                )
+            async with open_agent_services() as services:  # fresh connections: new event loop
                 tools = {tool.__name__: tool for tool in make_exam_writer_tools(services)}
                 return await tools[name](tool_context=SimpleNamespace(state=state), **arguments)
-            finally:
-                await qdrant.close()
-                await engine.dispose()
 
         return asyncio.run(_go())
 
