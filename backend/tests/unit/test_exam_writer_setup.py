@@ -30,6 +30,9 @@ def test_instructions_come_from_the_prompt_file_unchanged():
 def test_prompt_keeps_the_key_rules():
     prompt = PROMPT_FILE.read_text(encoding="utf-8")
     assert "Never invent a source" in prompt
+    assert "Every fact in a model answer or rubric line must be stated in the cited passages" in prompt
+    assert "about one search per question" in prompt  # each search is re-sent on every later call
+    assert "several search_course_materials calls at once" in prompt
     assert "Never include questions, answers or the rubric in the reply" in prompt
     assert "technical error twice" in prompt
 

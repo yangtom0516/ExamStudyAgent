@@ -5,6 +5,7 @@ reference for a realistic exam shape (see services/exam_profile.py). Past exams 
 or indexed, so their questions never show up in search results.
 """
 
+import re
 import uuid
 from pathlib import Path
 from typing import Protocol
@@ -52,11 +53,21 @@ class QuestionCounter(Protocol):
 # --- plain helpers (unit-tested) ----------------------------------------------------------
 
 _TYPES = {t.value for t in QuestionType}
+_WRITTEN = {QuestionType.SHORT_ANSWER, QuestionType.LONG_ANSWER}
+
+# A question label with an optional sub-part: "3", "Q3", "3a", "3(b)", "Q3.c", "3 (ii)".
+# "question" is the label without the sub-part ("Q3"), "n" its number. "3.2" doesn't match: in many
+# exams that is question 2 of section 3, a question of its own.
+_LABEL = re.compile(
+    r"^(?P<question>(?:question|problem|q)?\.?\s*(?P<n>\d+))\s*\.?\s*\(?(?P<part>[a-z]|[ivx]{1,4})?\)?$",
+    re.IGNORECASE,
+)
 
 
 def clean_questions(raw: list[QuestionItem]) -> list[QuestionItem]:
     """Make the model's answer safe to store: unknown types become "other", implausible points
-    are dropped, labels are trimmed, and the list is capped."""
+    are dropped, labels are trimmed, the list is capped, and sub-parts of one written question
+    are merged (see merge_sub_parts)."""
     cleaned = []
     for item in raw[:MAX_QUESTIONS]:
         kind = item.type.strip().lower().replace("-", "_").replace(" ", "_")
@@ -65,7 +76,36 @@ def clean_questions(raw: list[QuestionItem]) -> list[QuestionItem]:
         cleaned.append(
             QuestionItem(number=number, type=kind if kind in _TYPES else QuestionType.OTHER, points=points)
         )
-    return cleaned
+    return merge_sub_parts(cleaned)
+
+
+def merge_sub_parts(items: list[QuestionItem]) -> list[QuestionItem]:
+    """A written question counts once, including its sub-parts: "1a" and "1b" (both long answer,
+    25 points printed after 1b) become one question "1" worth 25. The model is told this but
+    doesn't always follow it, and 11 sub-parts read as 11 questions make ExamWriter write an exam
+    twice the real size.
+
+    Sub-parts stay separate when their types differ (as the counting rule says), and multiple-choice
+    items are never merged: "1a"-"1j" in a multiple-choice section are 10 questions.
+    """
+    merged: list[QuestionItem] = []
+    for item in items:
+        here = _LABEL.match(item.number)
+        last = merged[-1] if merged else None
+        before = _LABEL.match(last.number) if last else None
+        if (
+            here
+            and here["part"]
+            and before
+            and int(before["n"]) == int(here["n"])
+            and item.type == last.type
+            and item.type in _WRITTEN
+        ):
+            points = None if last.points is None and item.points is None else (last.points or 0) + (item.points or 0)
+            merged[-1] = QuestionItem(number=before["question"].strip(), type=item.type, points=points)
+        else:
+            merged.append(item)
+    return merged
 
 
 def build_prompt(pages: list[ParsedPage], title: str) -> str:

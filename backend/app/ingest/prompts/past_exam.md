@@ -11,7 +11,7 @@ List the questions in the order they appear. For each one give:
 
 How to count:
 - List every item a student answers separately. Each multiple-choice item counts once, so "Section A: 10 multiple choice questions" gives 10 entries.
-- A written question counts once, including its sub-parts (a), (b), (c), unless the sub-parts are clearly of different types; then list each sub-part with its own label, such as "3a" and "3b".
+- A written question counts once, including its sub-parts (a), (b), (c): questions "1a" and "1b" are one entry with number "1", and its points are the points of all its parts added up. Only when the sub-parts are clearly of different types, list each sub-part with its own label, such as "3a" and "3b".
 - Skip the cover page, instructions, and any printed solutions or answer keys.
 - If this is not an exam, return an empty list.
 

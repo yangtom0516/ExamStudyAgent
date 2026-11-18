@@ -24,6 +24,65 @@ def test_labels_are_trimmed_and_missing_ones_numbered():
     assert [c.number for c in cleaned] == ["Q 2", "2", "x" * 20]
 
 
+def test_sub_parts_of_a_written_question_count_once():
+    # The EECS 491 midterm as Gemini listed it: points printed once per question, after its last part.
+    cleaned = clean_questions(
+        [
+            q("1a", "long_answer"),
+            q("1b", "long_answer", 25),
+            q("2", "short_answer", 15),
+            q("3a", "long_answer"),
+            q("3b", "long_answer"),
+            q("3c", "long_answer", 30),
+            q("4a", "long_answer"),
+            q("4b", "long_answer"),
+            q("4c", "long_answer", 20),
+            q("5a", "short_answer"),
+            q("5b", "short_answer", 10),
+        ]
+    )
+    assert [(c.number, c.type, c.points) for c in cleaned] == [
+        ("1", "long_answer", 25),
+        ("2", "short_answer", 15),
+        ("3", "long_answer", 30),
+        ("4", "long_answer", 20),
+        ("5", "short_answer", 10),
+    ]
+
+
+def test_sub_part_labels_in_other_styles_are_merged_too():
+    cleaned = clean_questions(
+        [
+            q("Q4(a)", "short_answer", 3),
+            q("Q4 (b)", "short_answer", 4),
+            q("2.a", "long_answer"),
+            q("2.b", "long_answer"),
+            q("6(i)", "long_answer"),
+            q("6(ii)", "long_answer"),
+        ]
+    )
+    assert [(c.number, c.points) for c in cleaned] == [("Q4", 7), ("2", None), ("6", None)]
+
+
+def test_sub_parts_of_different_types_stay_separate():
+    cleaned = clean_questions([q("3a", "short_answer", 5), q("3b", "long_answer", 10)])
+    assert [c.number for c in cleaned] == ["3a", "3b"]
+
+
+def test_multiple_choice_items_are_never_merged():
+    # "1a" to "1c" in a multiple-choice section are three questions.
+    cleaned = clean_questions([q("1a", "multiple_choice", 2), q("1b", "multiple_choice", 2), q("1c", "multiple_choice")])
+    assert len(cleaned) == 3
+
+
+def test_separate_questions_are_not_merged():
+    # "3.1"/"3.2" are often questions 1 and 2 of section 3; 4a and 5a are different questions.
+    cleaned = clean_questions(
+        [q("3.1", "short_answer"), q("3.2", "short_answer"), q("4a", "long_answer"), q("5a", "long_answer")]
+    )
+    assert [c.number for c in cleaned] == ["3.1", "3.2", "4a", "5a"]
+
+
 def test_question_list_is_capped():
     assert len(clean_questions([q(str(i), "other") for i in range(MAX_QUESTIONS + 10)])) == MAX_QUESTIONS
 

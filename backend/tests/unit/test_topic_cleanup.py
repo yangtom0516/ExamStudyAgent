@@ -65,3 +65,12 @@ def test_prompt_contains_pages_existing_topics_and_title():
 
 def test_prompt_says_when_the_course_has_no_topics_yet():
     assert "(none yet)" in build_prompt([ParsedPage(1, "x")], existing=[], title="t")
+
+
+def test_prompt_treats_existing_names_as_reference_not_a_fixed_list():
+    # Worded as a command ("use exactly that name"), the model filed three Paxos lectures under
+    # older topics and left 48 pages with no topic at all.
+    prompt = build_prompt([ParsedPage(1, "x")], existing=["Heaps"], title="t")
+    assert "only when this document teaches that same concept" in prompt
+    assert "Everything else gets a new name of its own" in prompt
+    assert "Every page that teaches something belongs to at least one topic" in prompt

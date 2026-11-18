@@ -4,7 +4,7 @@ A multi-user web app where students upload lecture slides and past exams, then c
 
 Built as a portfolio project. Design choices should be defensible in an interview without being overkill: the expected load is a handful of users at once.
 
-**Status:** steps 1–3 (foundation, ingestion, rich ingestion) done; step 4 next (see [Build order](#build-order)).
+**Status:** steps 1–4 (foundation, ingestion, rich ingestion, ExamWriter) done; step 5 next (see [Build order](#build-order)).
 
 ---
 
@@ -166,7 +166,7 @@ Triggered by `POST /sessions/{id}/documents`: the API saves the file to object s
 2. OCR those pages with Gemini (`OCR_MODEL`, default `gemini-3.5-flash-lite`): each page is cut out as a one-page PDF and sent with `ingest/prompts/ocr.md` ("transcribe exactly"). Saved with `source = 'ocr'`. Pages already read in an earlier run of the same document are reused, so a Retry doesn't pay for OCR twice. More than `MAX_OCR_PAGES` (100) scanned pages in one file → `failed` with a "split the file" message.
 3. Save `pages` rows.
 4. Extract topics: **one** LLM call per document (`TOPIC_MODEL`, prompt `ingest/prompts/topics.md`, structured JSON output) → topics with page ranges → merge into course topics.
-   - The course's existing topic names are in the prompt ("reuse these names"), so documents don't create near-duplicates like "Heaps" / "Binary Heaps".
+   - The course's existing topic names are in the prompt **for reference only**: one is reused only when the document teaches that same concept (so no near-duplicates like "Heaps" / "Binary Heaps"); everything else gets a new name. Every teaching page gets a topic; a topic spans a few pages, up to ~15. (Worded as a command, "use exactly that name", the model filed three Paxos lectures under older topics and left 48 pages without any topic.)
    - The answer is cleaned (pages clamped to the document, junk names dropped, at most 20 topics), then merged by normalized name (lowercase, punctuation removed; `+`/`#` kept). New topics are inserted with `ON CONFLICT DO NOTHING` on `(course_id, normalized_name)`, so concurrent documents can't duplicate a topic.
    - Each chunk's payload `topics` = the topics whose range covers its page. Topics from an earlier run of the document are reused on Retry. An unusable answer fails the document (Retry).
    - Course topics stay when documents are deleted (coverage drops to 0), so scores carry over.
@@ -174,7 +174,7 @@ Triggered by `POST /sessions/{id}/documents`: the API saves the file to object s
 6. Mark the document `ready`.
 
 **Past exams** take a shorter path: parse → OCR → save `pages` → **count questions** (one call, `TOPIC_MODEL`, prompt `ingest/prompts/past_exam.md`, structured JSON: `number`, `type`, `points` per question) → `ready`. No topic call, no embeddings, no Qdrant points.
-- Counting rule: every separately answered item counts (10 MC items = 10 questions); a written question counts once including its sub-parts, unless the sub-parts are of different types.
+- Counting rule: every separately answered item counts (10 MC items = 10 questions); a written question counts once including its sub-parts, unless the sub-parts are of different types. The model doesn't always follow this, so code enforces it (`merge_sub_parts` in `ingest/past_exams.py`): consecutive sub-parts of one written question ("1a", "1(b)", "Q1.c") of the same type become one question "1" with their points added. Multiple-choice items are never merged, and "3.1"/"3.2" count as two questions. (Unmerged, an EECS 491 midterm with 5 questions read as 11, and ExamWriter wrote an exam twice the real size.)
 - Unknown types become `other`; implausible points are dropped. Zero questions found → still `ready` (contributes nothing). Retry reuses the stored structure.
 - The text stays in `pages`, so past exams could be indexed later without re-uploading.
 
@@ -226,11 +226,30 @@ Understands the request, asks follow-up questions when needed (topics, number an
 | `save_exam(title, questions)` | Runs the checks in `services/exams.py` and saves atomically; **returns the errors so the agent can fix and retry**. The request saved with the exam comes from state; on success the new id goes into state (`last_exam_id`) for the chat stream |
 | `get_weak_topics()` | Default focus when the request is vague (added in step 5, once scores exist) |
 
-The agent (`agents/exam_writer.py`, `build_exam_writer`) runs on `EXAM_MODEL` (default `gemini-3.8-flash`) with instructions from `agents/prompts/exam_writer.md`: goals and rules, not a fixed sequence (plan from the profile and copy the past exams' shape unless asked otherwise; search 1–2 times per topic; base every question on retrieved passages and cite them exactly; fix what `save_exam` reports; fewer questions when material is thin; a 2–4 sentence summary as the reply, **never the questions, answers or rubric**). The instruction is passed as a function so ADK doesn't treat `{…}` in the prompt as state variables. `run_exam_writer(services, settings, identity=, request=)` runs it once on an in-memory ADK session (identity in state) with `RunConfig(max_llm_calls=EXAM_MAX_LLM_CALLS)` (25; **ADK's own default is 500**), and returns the reply, `exam_id` (from state, so it's reported even if the run fails after saving), every tool call and result, model calls and tokens. It never raises: call limit → "I couldn't finish that; try a smaller request.", other failures → a friendly message.
+The agent (`agents/exam_writer.py`, `build_exam_writer`) runs on `EXAM_MODEL` (default `gemini-3.8-flash`) with instructions from `agents/prompts/exam_writer.md`: goals and rules, not a fixed sequence:
+- plan from the profile and copy the past exams' shape unless asked otherwise;
+- decide which question goes on which topic first, then search: about one search per question, asked for **in one step** (Gemini can return several tool calls in one reply, and ADK runs them all), then again only to fill gaps; past exams can't be searched;
+- base every question on retrieved passages and cite them exactly; every fact in a model answer or rubric line must be in the cited passages; ask about a scenario only if the passages show all of it;
+- multiple-choice options similar in length; model answers short (2–4 sentences per part);
+- fix what `save_exam` reports; fewer questions when material is thin;
+- reply with a 2–4 sentence summary, **never the questions, answers or rubric**.
+
+The instruction is passed as a function so ADK doesn't treat `{…}` in the prompt as state variables. `run_exam_writer(services, settings, identity=, request=)` runs it once on an in-memory ADK session (identity in state) with `RunConfig(max_llm_calls=EXAM_MAX_LLM_CALLS)` (25; **ADK's own default is 500**), and returns the reply, `exam_id` (from state, so it's reported even if the run fails after saving), every tool call and result, model calls and tokens. It never raises: call limit → "I couldn't finish that; try a smaller request.", other failures → a friendly message.
 
 No `list_course_topics()` for ExamWriter: course topics from other sessions have no material here to cite (StudyCoach gets it). Tools live in `agents/tools/` (`make_exam_writer_tools(AgentServices)`); each reads the identity from `tool_context.state` (`agents/tools/context.py`, `initial_state`) and returns `{"ok": false, "error": …}` if it's missing.
 
 If materials are thin for a requested topic, it writes fewer questions and says so.
+
+**Trying it:** `uv run python scripts/write_exam.py` (from `backend/`, data stores up) lists the sessions (and flags pages whose text is still scrambled); `uv run python scripts/write_exam.py <session id> "<request>"` runs ExamWriter once with real Gemini on an active session. It prints each tool call and its result live, the reply, model calls/tokens/estimated cost, and a **developer view of the saved exam with answers, rubric and the start of each cited page**, to check that questions are right and really come from those slides. Options: `--model` (e.g. compare `gemini-3.5-flash-lite`), `--max-calls`.
+
+Measured on three EECS 491 Paxos lectures plus a past midterm (gemini-3.8-flash):
+
+| Request | Searches | Model calls | Input + output tokens | Cost | Time |
+|---|---|---|---|---|---|
+| "5 questions on Paxos, mostly multiple choice" | 6 | 9 of 25 | 48k + 6k | ~$0.06 | 61 s |
+| "give me a practice midterm" (2 short + 3 long, 100 points, multi-part questions) | 19–23 | 17–22 of 25 | 250–290k + 15k | ~$0.25–0.28 | ~150 s |
+
+Input tokens dominate the cost: every passage stays in the conversation and is re-sent on every later call, so the number of searches is what drives it. The final step (`save_exam` with the whole exam) is one long generation that takes a minute or two with no output.
 
 ### Grader
 
@@ -383,7 +402,7 @@ JWT_SECRET=
 ## Deployment
 
 - **Local:** `docker compose up -d` → web at http://localhost:3000, Qdrant dashboard at http://localhost:6333/dashboard, Flower at http://localhost:5555.
-- **Local, before the app services are containerized:** `docker compose up -d` runs only the data stores. From `backend/`, run the API with `uv run uvicorn app.main:app --reload` and the worker with `uv run celery -A app.worker.celery_app worker -Q ingest -P solo --loglevel=info` (`-P solo` because Celery's default process pool doesn't work on Windows). SeaweedFS's file browser is at http://localhost:8888/buckets/ (local only).
+- **Local, before the app services are containerized:** `docker compose up -d` runs only the data stores. From `backend/`, run the API with `uv run uvicorn app.main:app --reload` and the worker with `uv run celery -A app.worker.celery_app worker -Q ingest -P solo --loglevel=info` (`-P solo` because Celery's default process pool doesn't work on Windows). Restart the worker after changing an ingestion prompt (prompts are read when it starts). SeaweedFS's file browser is at http://localhost:8888/buckets/ (local only). To try ExamWriter: `uv run python scripts/write_exam.py` (see [ExamWriter](#examwriter)).
 - **Cloud demo:** one VM (~4 GB RAM minimum) running the same compose file plus `caddy` for HTTPS; domain optional (a free subdomain works).
 - **Demo account** preloaded with the Monopoly sample course (`data/samples/`).
 - Nightly `pg_dump` backup. Qdrant is rebuildable from `pages`.
@@ -391,7 +410,7 @@ JWT_SECRET=
 ### Costs
 
 - All software in the stack is free/open source. Running locally costs nothing beyond API usage.
-- **Gemini API** is the main variable cost: embeddings (per chunk), OCR (per scanned page, the most expensive ingestion step), topic extraction (per document), every chat turn, ExamWriter (many calls per exam), Grader (per written answer), evals. The AI Studio free tier has rate limits, and Google may use free-tier inputs to improve its products: don't upload material you can't share while on the free tier.
+- **Gemini API** is the main variable cost: embeddings (per chunk), OCR (per scanned page, the most expensive ingestion step), topic extraction (per document), every chat turn, ExamWriter (~$0.06 for a short quiz, ~$0.25–0.30 for a full midterm; see [ExamWriter](#examwriter)), Grader (per written answer), evals. The AI Studio free tier has rate limits, and Google may use free-tier inputs to improve its products: don't upload material you can't share while on the free tier.
 - **Public demo risk:** strangers spending your API quota. Keep the Redis rate limits, stricter demo limits, and a budget alert/cap on the Google account.
 - Cloud VM ~$5–20/month (or free-tier/credit offers; verify current terms). Domain optional (~$10–15/year).
 
@@ -417,6 +436,7 @@ JWT_SECRET=
 │   │   ├── agents/          study_coach.py, exam_writer.py, grader.py, tools/, prompts/
 │   │   ├── grading/         MCQ grading, topic score math (plain code)
 │   │   └── worker/          celery_app.py, tasks.py
+│   ├── scripts/             developer tools: write_exam.py (try ExamWriter on a real session)
 │   └── tests/               unit/, api/, evals/
 ├── frontend/                Next.js app
 └── data/samples/            Monopoly files (tests + demo)
@@ -433,7 +453,7 @@ Each step ends with something runnable.
 - [x] **1. Foundation:** docker-compose (Postgres, Redis, Qdrant, object storage), FastAPI skeleton, config, Alembic, username/password auth.
 - [x] **2. Ingestion:** courses, sessions (setup/active), upload → Celery → PDF/PPTX text → chunks → Qdrant; progress SSE; session start/lock rules.
 - [x] **3. Rich ingestion:** OCR for scanned pages, topic extraction, past-exam structure (question types and points) + exam profile, hybrid search.
-- [ ] **4. ExamWriter** + its tools + exam schema (try it via a script or `adk web`).
+- [x] **4. ExamWriter** + its tools + exam schema (try it with `scripts/write_exam.py`).
 - [ ] **5. Grader**, MCQ grading, attempts, topic scores.
 - [ ] **6. StudyCoach** + streaming chat endpoint + chat lock + rate limits.
 - [ ] **7. Frontend** screens.
@@ -449,3 +469,7 @@ Backend first (1–6) so the hard parts work before any UI exists.
 - **Models:** embeddings use `gemini-embedding-2` (768 dims); OCR and other ingestion calls use `gemini-3.5-flash-lite`; ExamWriter uses `gemini-3.8-flash`. Still to choose: coach / grader (likely `gemini-3.8-flash`).
 - **Scrambled-font PDFs, known gaps:** (1) `looks_garbled` misses diagram pages where pypdf inserts real spaces between labels (few `\x03`); a second signal ("control characters present and < 20% of letters lowercase") would catch them. (2) Gemini OCR returned empty text for some diagram-heavy slides (e.g. timeline diagrams); not yet diagnosed (check the raw response's finish/block reason, maybe retry or tweak the "return nothing" rule in `ocr.md`).
 - **Sample data:** `data/samples/` doesn't exist yet; add the Monopoly sample files (PDF/Markdown) before agent evals and the demo account.
+- **ExamWriter searches more than the prompt asks:** for a 5-question midterm it ran 19–23 searches against a budget of about 5. About 10 went to topics it then didn't use (it explores before planning), and multi-part 25-point questions make it gather material per part. Batching cut model calls (22 → 17) but not cost. Fix if needed: a hard limit in code (e.g. 12 searches per run; after that the tool answers "search limit reached; write the exam with what you have"), which also caps a run's cost.
+- **ExamWriter's model answers for multi-slide scenarios** sometimes use their own example (other replica names or proposal numbers than the slides), despite the prompt rule. Rubric lines stay general, so grading isn't affected; an eval should check it (step 8).
+- **Topic names are sometimes slide titles**, not concepts ("First Three Wrong Ideas", "Wrong Idea Sequence Numbers" over 29 pages), or ambiguous ("Confinement", which ExamWriter first searched as a security topic). Step 5 shows these names next to scores; consider "name the concept, not the slide" in `topics.md`.
+- **Repeated slides fill search results:** PowerPoint exports repeat a slide for each animation step, and later decks repeat earlier slides as a recap, so several of the 5 passages can be the same text. Dropping near-identical passages in `search_course_materials` would make room for more material.
